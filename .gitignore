@@ -1,0 +1,23 @@
+# ── The credential ────────────────────────────────────────────────────────
+# ntfy topic: anyone who knows it can read your notifications and post to
+# them. It lives only in ~/.config/ntfy-notify.conf, never in git.
+ntfy-notify.conf
+config/ntfy-notify.conf
+!config/ntfy-notify.conf.example
+
+# ── Runtime state ─────────────────────────────────────────────────────────
+# Counters, cursors, dedup history, health verdicts, heartbeats. Machine
+# local by nature — recreating them is harmless, committing them is noise.
+state/
+*.state
+*.cursor
+
+# ── Python ────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# ── Logs / scratch ────────────────────────────────────────────────────────
+*.log
+*.tmp
+.DS_Store

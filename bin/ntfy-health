@@ -1,0 +1,285 @@
+#!/usr/bin/env python3
+"""
+ntfy-health — watchdog for OpenCode and the notification stack.
+
+Alerts only on TRANSITIONS (healthy → broken, broken → healthy) so it stays
+quiet while everything is fine and tells you the moment something actually
+dies. A dead notifier is exactly when you most need to know.
+
+Checks (oc.WATCHED_UNITS / oc.WATCHED_TIMERS are the single source):
+  * every long-running ntfy service is active
+  * every ntfy timer still has a next run scheduled
+  * a oneshot that failed on its last run
+  * the OpenCode server answering, not just its PID existing
+  * can we actually PUSH to ntfy.sh — reachability alone lies, because a GET
+    keeps returning 200 while our publishes are refused with 429
+
+Usage:
+  ntfy-health            check once, notify on change
+  ntfy-health -n         print only, change nothing
+  ntfy-health -s         show current status, change nothing
+  ntfy-health --reset    forget stored state (the next scheduled run then
+                         records a baseline instead of alerting)
+
+Exit codes: 0 healthy, 3 problems found, anything else = this check crashed.
+The unit declares SuccessExitStatus=0 3, so only a genuine crash marks it
+failed, and the "a oneshot that failed on its last run" check stays meaningful
+instead of pointing at ntfy-health itself whenever it found something.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ntfy_oc as oc
+
+STATE_DIR = oc.STATE_DIR
+STATUS_FILE = os.path.join(STATE_DIR, "health.json")
+NOTIFY = oc.NOTIFY
+NTFY_SERVER = oc.NTFY_SERVER
+TOPIC = oc.TOPIC
+
+# Alert if ntfy is unreachable for this many consecutive checks. The route to
+# ntfy.sh from this host drops packets regularly, so one bad sample is noise.
+NTFY_FAIL_THRESHOLD = 3
+
+# Exit codes: 0 = healthy, 3 = problems found, anything else = this check
+# crashed. The unit declares SuccessExitStatus=0 3, so "I found problems" is
+# not a unit failure. Exiting 1 for it used to be: systemd marked the unit
+# failed, the next run found ntfy-health's own unit broken, reported that as a
+# problem, and so swallowed the recovery notice for the real one.
+EXIT_PROBLEMS = 3
+
+os.makedirs(STATE_DIR, exist_ok=True)
+
+
+def sh(*args: str) -> str:
+    try:
+        return subprocess.run(args, capture_output=True, text=True,
+                              timeout=15).stdout.strip()
+    except Exception:
+        return ""
+
+
+def check_units() -> tuple[list[str], list[str]]:
+    """
+    Returns (ok, broken) across the whole stack.
+
+    Watches every long-running service and every timer, not just two: a dead
+    keepawake or an unscheduled stuck-timer fails quietly otherwise, and
+    quiet failure is exactly what a watchdog exists to prevent.
+    """
+    ok, bad = [], []
+
+    for unit in oc.WATCHED_UNITS:
+        state = sh("systemctl", "--user", "is-active", unit)
+        if state == "active":
+            ok.append(unit.replace(".service", ""))
+        else:
+            bad.append(f"{unit} ({state or 'unknown'})")
+
+    # A timer with no NEXT time has stopped being scheduled.
+    listed = sh("systemctl", "--user", "list-timers", "--no-pager")
+    for timer in oc.WATCHED_TIMERS:
+        if timer not in listed:
+            bad.append(f"{timer} (missing)")
+        elif re.search(rf"^\s*\S+\s+\S+\s+\S+\s+{re.escape(timer)}\b", listed, re.M) \
+                and re.search(rf"-\s+-\s+{re.escape(timer)}", listed):
+            bad.append(f"{timer} (not scheduled)")
+        else:
+            ok.append(timer.replace(".timer", ""))
+
+    # A oneshot that failed is worth knowing about even if the timer re-fires.
+    for unit in ("ntfy-heartbeat.service", "ntfy-stuck.service", "ntfy-health.service"):
+        if sh("systemctl", "--user", "is-failed", unit) == "failed":
+            bad.append(f"{unit} (last run failed)")
+
+    return ok, bad
+
+
+def check_opencode() -> tuple[bool, str]:
+    """Is the OpenCode server up and ANSWERING (not merely alive)?"""
+    if not oc.service_info():
+        return False, "OpenCode is not running"
+    # oc.get() swallows every exception and returns None, so the old
+    # `(oc.get(...) or {}).get("data")` could not raise: `.get("data")` ran on
+    # {} and the "unreachable" branch below was unreachable code. A hung API
+    # behind a live PID reported "ok".
+    if oc.get("/api/session") is None:
+        return False, "API not answering"
+    return True, "ok"
+
+
+NOTIFY_STATE_DIR = os.path.join(
+    os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")),
+    "ntfy-notify")
+
+
+def _publish_refusal() -> str:
+    """The reason ntfy-notify last recorded for a refused publish, if fresh."""
+    try:
+        with open(os.path.join(NOTIFY_STATE_DIR, "publish_blocked")) as fh:
+            lines = fh.read().splitlines()
+        age = time.time() - float(lines[0])
+    except Exception:
+        return ""
+    # The marker is cleared by the next successful publish, so one still
+    # standing after a day is stale rather than current.
+    if age > 24 * 3600:
+        return ""
+    reason = lines[1].strip() if len(lines) > 1 else "publish refused"
+    if "quota" in reason.lower():
+        return "daily message quota exhausted — nothing can be delivered"
+    return f"publish refused ({reason[:100]})"
+
+
+def check_ntfy() -> tuple[bool, str, bool]:
+    """Can we actually PUSH — not merely reach the server?
+
+    The GET below keeps returning 200 while ntfy.sh refuses our publishes
+    with 429 "daily message quota reached". Rating that as "reachable" was
+    the watchdog calling a channel that could deliver nothing healthy, which
+    is precisely the failure it exists to catch. The refusal marker (written
+    by ntfy-notify, cleared on the next success) answers the real question;
+    the GET only says whether the server itself is up.
+    """
+    refusal = _publish_refusal()
+    if refusal:
+        # Definitive: the server told us it will not deliver. This does not
+        # clear on its own, so it gets no grace — the 3-strike rule exists
+        # for this host's packet-dropping route, not for a quota the server
+        # has already counted out for us.
+        return False, refusal, True
+    try:
+        with urllib.request.urlopen(f"{NTFY_SERVER}/{TOPIC}/json?poll=1&since=latest",
+                                    timeout=12) as r:
+            if r.status != 200:
+                return False, f"unexpected HTTP {r.status}", False
+    except Exception as exc:
+        return False, f"unreachable ({exc})", False
+    return True, "reachable", False
+
+
+def load_state() -> dict:
+    try:
+        return json.load(open(STATUS_FILE))
+    except Exception:
+        return {}
+
+
+def save_state(s: dict) -> None:
+    try:
+        json.dump(s, open(STATUS_FILE, "w"))
+    except Exception:
+        pass
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("-n", "--dry", action="store_true")
+    ap.add_argument("-s", "--status", action="store_true", help="print only")
+    ap.add_argument("--reset", action="store_true")
+    args = ap.parse_args()
+
+    if args.reset:
+        if os.path.exists(STATUS_FILE):
+            os.remove(STATUS_FILE)
+        print("health state reset")
+        return 0
+
+    oc_ok, oc_detail = check_opencode()
+    unit_ok, unit_bad = check_units()
+    ntfy_ok, ntfy_detail, ntfy_definitive = check_ntfy()
+
+    prev = load_state()
+    ntfy_fails = int(prev.get("ntfy_fails", 0))
+    ntfy_fails = 0 if ntfy_ok else ntfy_fails + 1
+    if ntfy_definitive:
+        ntfy_fails = max(ntfy_fails, NTFY_FAIL_THRESHOLD)
+
+    problems = list(unit_bad)
+    if not oc_ok:
+        problems.append(f"OpenCode: {oc_detail}")
+    if ntfy_fails >= NTFY_FAIL_THRESHOLD:
+        problems.append(f"Phone push: {ntfy_detail} ({ntfy_fails} checks)")
+
+    healthy = not problems
+    lines = []
+    lines.append("🟢 All healthy" if healthy else "🔴 Problems")
+    lines.append("")
+    lines.append(f"OpenCode: {'running' if oc_ok else oc_detail}")
+    for u in unit_ok:
+        lines.append(f"  ok  {u}")
+    for b in unit_bad:
+        lines.append(f"  BAD {b}")
+    lines.append("Phone push: " + ("reachable" if ntfy_ok else
+                                   f"{ntfy_detail} ({ntfy_fails}x)"))
+
+    body = "\n".join(lines)
+    print(body)
+
+    state = {
+        "healthy": healthy,
+        "ntfy_fails": ntfy_fails,
+        "checked": time.time(),
+        "opencode": oc_ok,
+        "ntfy": ntfy_detail,
+        "problems": problems,
+    }
+
+    was = prev.get("healthy")
+
+    # Read-only modes return BEFORE the state is saved. Writing here recorded
+    # the very transition they were inspecting, so the next scheduled run saw
+    # "no change" and stayed silent — looking at a broken stack with -s
+    # silenced the watchdog for the problem you had just checked on.
+    if args.status or args.dry:
+        return 0 if healthy else EXIT_PROBLEMS
+
+    save_state(state)
+
+    # Only speak up on a change of state, or on the first ever check.
+    if was is None:
+        # first run: don't cry wolf, just record
+        print("(first check recorded — no alert sent)")
+        return 0 if healthy else EXIT_PROBLEMS
+    if was == healthy:
+        # No transition, so nothing to say — but the exit code still has to
+        # describe the state. Reporting "healthy" from the shell while the
+        # stack is broken is what makes rc unreadable in the first place.
+        return 0 if healthy else EXIT_PROBLEMS
+
+    if healthy:
+        body = "Everything is back to normal.\n\n" + body
+        args_out = ["-p", "high", body, "OpenCode · recovered",
+                    "white_check_mark"]
+    else:
+        body = ("Something needs attention:\n\n" + body)
+        args_out = ["-p", "urgent", body, "OpenCode · problem",
+                    "rotating_light"]
+
+    if not os.path.exists(NOTIFY):
+        print(f"ntfy-notify missing at {NOTIFY} — cannot alert", file=sys.stderr)
+        return 0 if healthy else EXIT_PROBLEMS
+    try:
+        sent = subprocess.run([NOTIFY] + args_out, capture_output=True,
+                              timeout=120)
+        if sent.returncode:
+            print(f"ntfy-notify failed (rc={sent.returncode}): "
+                  f"{sent.stderr.decode(errors='replace')[:200]}",
+                  file=sys.stderr)
+    except Exception as exc:
+        print(f"ntfy-notify error: {exc}", file=sys.stderr)
+    return 0 if healthy else EXIT_PROBLEMS
+
+
+if __name__ == "__main__":
+    sys.exit(main())

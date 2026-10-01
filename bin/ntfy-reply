@@ -1,0 +1,720 @@
+#!/usr/bin/env python3
+"""
+ntfy-reply — lets Frappppy steer OpenCode from their phone.
+
+Why this exists
+---------------
+"I need you" notifications used to be a dead end: you get the ping, then have
+to walk to the PC to answer. This closes the loop.
+
+The problem is network topology: this machine sits on a VirtualBox NAT address
+(10.0.2.15), so your phone cannot reach a local HTTP endpoint. ntfy's
+`http` action buttons point *inward* at a URL, which NAT blocks.
+
+The working direction is the other way round — the phone PUBLISHES and this
+box SUBSCRIBES, because the outbound connection to ntfy.sh is allowed. So:
+
+    phone  --publish-->  <topic>-r  <--subscribe--  ntfy-reply
+                                                        |
+                                                        v
+                                          session.prompt / permission.reply
+
+Replies arriving here are routed to OpenCode as a real prompt, or used to
+answer a pending permission/form request.
+
+Usage:
+  ntfy-reply              run in foreground (systemd does this)
+  ntfy-reply --once       drain pending replies and exit (testing)
+  ntfy-reply --dry        log, don't send anything back to the phone
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ntfy_oc as oc
+
+BASE_TOPIC = oc.TOPIC
+REPLY_TOPIC = os.environ.get("NTFY_REPLY_TOPIC", f"{BASE_TOPIC}-r")
+NTFY_SERVER = oc.NTFY_SERVER
+NOTIFY = oc.NOTIFY
+STATE_DIR = oc.STATE_DIR
+CURSOR_FILE = os.path.join(STATE_DIR, "reply_cursor.json")
+# Written by ntfy-ask; a reply of pure numbers answers it.
+QUESTION_FILE = os.path.join(STATE_DIR, "pending_question.json")
+# Marker proving the cursor has been initialised at least once, so restarts
+# never re-seed (which would drop real replies sent while we were down).
+SEED_MARKER = os.path.join(STATE_DIR, "reply_seeded.marker")
+QUESTION_TTL_S = 45 * 60
+
+os.makedirs(STATE_DIR, exist_ok=True)
+STOP = threading.Event()
+DRY = False
+
+# We listen on the base topic as well (that is the one the user is subscribed
+# to), so self-talk filtering is required. It is done on the Title alone —
+# see is_our_own() for why tags are not used.
+
+# Guard against a runaway loop: max replies processed per wake.
+MAX_BATCH = 20
+
+def is_our_own(m: dict) -> bool:
+    """
+    True if this message is one of our notifications, not a human reply.
+
+    Decided on the TITLE alone. Every notification we send goes through
+    ntfy-notify, which always sets a Title, and all of ours start with
+    "OpenCode" - so that is a complete and reliable signal.
+
+    Tags are deliberately NOT used. Rejecting on tags looked safe but silently
+    swallowed genuine replies: if Frappppy ever sent one carrying a tag we
+    happen to use (e.g. "hand"), the reply vanished with no error. Two earlier
+    versions had this same class of bug - first on "any title", now on tags.
+    """
+    return (m.get("title") or "").strip().lower().startswith("opencode")
+
+# A "I need you" prompt binds replies to that session, but only briefly —
+# after this, an unbound reply must ask rather than guess.
+BIND_TTL_S = 15 * 60
+
+def log(msg: str) -> None:
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+# ── OpenCode access ─────────────────────────────────────────────────────────
+# service_info / api / running_sessions live in ntfy_oc now: they were
+# duplicated across four scripts, and a silent divergence between copies is
+# exactly how the earlier "lookup returned empty" bugs happened.
+service_info = oc.service_info
+api = oc.api
+
+# ── who are we talking to? ─────────────────────────────────────────────────
+def active_sessions() -> list[dict]:
+    """Running sessions as [{id, title}], ordered deterministically."""
+    return oc.running_sessions()
+
+def target_session() -> dict | None:
+    """
+    Pick which session a phone reply should go to.
+
+    Preference order:
+      1. exactly one session running -> unambiguous, use it
+      2. a session we recently ASKED something of -> their reply goes back
+         there
+      3. otherwise None. Never guess: an earlier version picked "most
+         recently updated" and silently delivered to the wrong thread.
+    """
+    running = active_sessions()
+    if not running:
+        return None
+    if len(running) == 1:
+        # Only one session is live, so it is the only possible target.
+        return running[0]
+
+    # A session that recently asked us something is the most likely intent.
+    bound = oc.bound_session(ttl_s=BIND_TTL_S)
+    if bound and bound.get("id"):
+        for r in running:
+            if r["id"] == bound["id"]:
+                return r
+
+    # Multiple candidates and nothing to disambiguate: DO NOT guess. An
+    # earlier version picked "most recently updated", which silently sent
+    # the message to the wrong session. Ask instead.
+    return None
+
+def sticky_target() -> dict | None:
+    """
+    The session bound by a recent "I need you" prompt, if still fresh.
+
+    Kept separate from target_session() because a binding is an EXPLICIT
+    signal: we asked the user a question, so their reply belongs there.
+    The binding expires quickly so a later reply is never routed to a
+    session that asked something an hour ago.
+    """
+    bound = oc.bound_session(ttl_s=BIND_TTL_S)
+    if not bound or not bound.get("id"):
+        return None
+    return {"id": bound["id"], "title": bound.get("title") or bound["id"]}
+
+def shorten_name(session: dict) -> str:
+    return oc.shorten(session.get("title", ""))
+
+
+def session_roster() -> str:
+    """
+    Every session, working and idle, via the shared renderer so the roster on
+    the phone matches exactly what the heartbeat shows. Idle sessions are
+    included because a reply wakes one up - that is how Frappppy picks up an
+    older thread while away from the machine.
+    """
+    return oc.roster_text()
+
+
+def parse_target(text: str) -> tuple[dict | None, str, bool, int]:
+    """
+    Split a reply into (session, remainder, remainder_is_options, bad_index).
+
+      "focus on X"    -> (None, "focus on X", False, 0)
+      "#2 focus on X" -> (session 2, "focus on X", False, 0)
+      "#2, 1"         -> (session 2, "1", True, 0)
+      "#2, 1, 3"      -> (session 2, "1,3", True, 0)
+      "1,3"           -> (None, "1,3", True, 0)
+      "#9 hello"      -> (None, "hello", False, 9)   <- no such session
+
+    The flag lets `#2, 1` mean "session 2, option 1" while a bare `1,3` still
+    means options in whichever session is targeted.
+
+    bad_index carries a "#N" that matched no session. Returning None for it
+    (the old behaviour) looked identical to "no #N given at all", so "#9
+    hello" was carried onward as literal text and delivered to whatever
+    session won the tie — a mistyped number became a silent misroute. 0 means
+    no bad index was given.
+    """
+    msg = (text or "").strip()
+    if not msg.startswith("#") or len(msg) < 2 or not msg[1].isdigit():
+        is_opts = bool(msg) and bool(re.fullmatch(r"[\d\s,]+", msg))
+        return None, msg, is_opts, 0
+
+    m = re.match(r"#(\d+)\s*,?\s*(.*)$", msg, re.S)
+    if not m:
+        return None, msg, False, 0
+    idx = int(m.group(1))
+    rest = m.group(2).strip()
+    # Resolve against EVERY session, not just running ones: replying to a
+    # parked session is how Frappppy picks up an older thread remotely.
+    rows = oc.all_sessions()
+    session = rows[idx - 1] if 1 <= idx <= len(rows) else None
+    is_opts = bool(rest) and bool(re.fullmatch(r"[\d\s,]+", rest))
+    return session, rest, is_opts, (0 if session else idx)
+
+# NOTE: load_bound()/save_bound() used to live here. Both are gone — the
+# binding now lives in ntfy_oc (bind_session / bound_session) so the TTL rule
+# exists in one place, and so only the "we asked something" side can write it.
+
+# ── pending permission / form we could answer ──────────────────────────────
+def pending_permission() -> dict | None:
+    svc = service_info()
+    if not svc:
+        return None
+    base, pw = svc
+    try:
+        data = (api(base, pw, "/api/permission/request") or {}).get("data") or []
+    except Exception:
+        return None
+    return data[0] if data else None
+
+def reply_permission(perm: dict, decision: str) -> bool:
+    svc = service_info()
+    if not svc:
+        return False
+    base, pw = svc
+    sid = perm.get("sessionID")
+    rid = perm.get("id")
+    if not sid or not rid:
+        return False
+    try:
+        api(base, pw, f"/api/session/{sid}/permission/{rid}/reply",
+            {"decision": decision})
+        log(f"permission {rid} -> {decision}")
+        return True
+    except Exception as exc:
+        log(f"permission reply failed: {exc}")
+        return False
+
+# ── phone -> opencode ──────────────────────────────────────────────────────
+def send_to_phone(body: str, title: str, tag: str = "white_check_mark",
+                  prio: str | None = None) -> None:
+    if DRY:
+        log(f"DRY ack: {title}: {body}")
+        return
+    if not os.path.exists(NOTIFY):
+        return
+    cmd = [NOTIFY, "-g", "reply"]
+    if prio:
+        cmd += ["-p", prio]
+    cmd += [body, title, tag]
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    if res.returncode:
+        log(f"ack failed: {(res.stderr or res.stdout).strip()}")
+
+def load_question() -> dict | None:
+    try:
+        q = json.load(open(QUESTION_FILE))
+    except Exception:
+        return None
+    if time.time() - q.get("created", 0) > QUESTION_TTL_S:
+        return None
+    return q
+
+def answer_question(msg: str, forced: dict | None = None) -> bool:
+    """
+    If a numbered question is pending and the reply is just numbers, turn it
+    into an answer and send it back into the session. Returns True when the
+    message was consumed as an answer.
+    """
+    q = load_question()
+    if not q:
+        return False
+
+    text = msg.strip()
+    if not text:
+        return False
+
+    # ── they chose "type my own" — this message IS the answer ──
+    if q.get("awaiting_text"):
+        try:
+            os.remove(QUESTION_FILE)
+        except Exception:
+            pass
+        log(f"free-text answer: {text[:50]}")
+        send_to_phone("Got it, thanks.", "OpenCode · answer received",
+                      "white_check_mark")
+        return deliver_text_answer(q, text, forced)
+
+    # ── 0 / "skip" — abandon the question without answering ──
+    if text in ("0", "skip", "skip all", "skipall", "none"):
+        try:
+            os.remove(QUESTION_FILE)
+        except Exception:
+            pass
+        send_to_phone(f"Skipped: \"{q['question']}\"",
+                      "OpenCode · question skipped", "no_entry")
+        log(f"question skipped: {q['question'][:50]}")
+        return True
+
+    # ── S / "own" — they want to type an answer instead ──
+    if text.lower() in ("s", "own", "type", "custom", "t"):
+        q["awaiting_text"] = True
+        try:
+            json.dump(q, open(QUESTION_FILE, "w"))
+        except Exception:
+            pass
+        where = q.get("session_title") or "the session that asked"
+        send_to_phone(
+            f"Go ahead — send your answer and it goes to {where}.",
+            "OpenCode · type your answer", "pencil")
+        return True
+
+    # Accept "1", "1,3", "1 3" — and nothing else.
+    if not re.fullmatch(r"[\d\s,]+", text):
+        return False
+
+    picks: list[int] = []
+    for part in re.split(r"[,\s]+", text):
+        if not part:
+            continue
+        try:
+            n = int(part)
+        except ValueError:
+            return False
+        if not (1 <= n <= len(q["options"])):
+            # Out of range: tell them and keep the question open so they can
+            # answer again. Consuming it here would silently lose the answer.
+            hint = f"  (that question was for {q.get('session_title')})" if q.get("session_title") else ""
+            send_to_phone(
+                f"There's no option {n} on that question — "
+                f"pick 1 to {len(q['options'])}.{hint}",
+                "OpenCode · quick question", "warning")
+            return True
+        if n not in picks:
+            picks.append(n)
+
+    if not picks:
+        return False
+
+    try:
+        os.remove(QUESTION_FILE)
+    except Exception:
+        pass
+
+    pretty = ", ".join(f"{q['options'][n - 1]}" for n in picks)
+    log(f"question answered: {pretty}")
+
+    send_to_phone(f"You picked: {pretty}", "OpenCode · got it",
+                  "white_check_mark")
+
+    return deliver_text_answer(
+        q, f"Frappppy's answer to \"{q['question']}\": {pretty}", forced)
+
+def deliver_text_answer(q: dict, text: str,
+                        forced: dict | None = None) -> bool:
+    """
+    Push an answer into a session. An explicit "#N" wins; otherwise the
+    session that asked the question; otherwise the usual target rules.
+    """
+    target = forced
+    mismatch = None
+    if not target and q.get("session_id"):
+        target = {"id": q["session_id"], "title": q.get("session_title", "session")}
+    if not target:
+        target = sticky_target() or target_session()
+    if not target:
+        send_to_phone("Answer recorded, but no session is running to give it to.",
+                      "OpenCode · reply", "warning", "high")
+        return True
+
+    # If the question was asked elsewhere, say so in the delivered text so a
+    # mistyped #N is visible rather than silently misrouted.
+    if (not forced and q.get("session_id")
+            and q["session_id"] != target["id"]):
+        mismatch = q.get("session_title")
+
+    svc = service_info()
+    if not svc:
+        return True
+    base, pw = svc
+    note = (f" (note: this question was asked in \"{mismatch}\")"
+            if mismatch else "")
+    try:
+        api(base, pw, f"/api/session/{target['id']}/prompt",
+            {"text": f"{text}{note}"}, timeout=20)
+        # Deliberately NOT binding here: we are answering, not asking. Binding
+        # on delivery is what misrouted a later unrelated phone reply.
+        log(f"answer delivered to {target['title']}")
+    except Exception as exc:
+        log(f"answer delivery failed: {exc}")
+        send_to_phone(f"Could not deliver that answer: {exc}",
+                      "OpenCode · reply", "x", "high")
+    return True
+
+def handle_reply(text: str) -> None:
+    msg = (text or "").strip()
+    if not msg:
+        return
+
+    low = msg.lower()
+
+    # "?" — show every session and where a bare reply would land.
+    if low in ("?", "who", "where", "target"):
+        rows = oc.all_sessions()
+        if not rows:
+            body = "No sessions yet."
+        elif len(rows) == 1:
+            body = oc.roster_text() + "\n\n#1 is the only session — a plain reply goes there."
+        else:
+            sticky = sticky_target()
+            body = "Where would a plain reply go?\n\n" + oc.roster_text()
+            if sticky:
+                body += f"\n\nA bare reply goes to {shorten_name(sticky)}."
+            body += "\nSend  #<number>  then your message."
+        q = load_question()
+        if q:
+            body += f"\n\nStill waiting on your answer to:\n\"{q['question']}\""
+        send_to_phone(body, "OpenCode · sessions", "brain")
+        return
+
+    # Route first: "#2, 1" means session 2 + option 1; "#2 hello" means
+    # session 2 + free text. Both need parsing before the question check.
+    session_hint, rest, is_opts, bad_index = parse_target(msg)
+
+    # A "#N" that matches no session is reported, never reinterpreted. It
+    # used to fall through as literal text and get delivered to some other
+    # session, so a mistyped number quietly sent "#9 hello" somewhere.
+    if bad_index:
+        send_to_phone(
+            f"There is no session #{bad_index}.\n\n{session_roster()}",
+            "OpenCode · which session?", "question")
+        return
+
+    # If they picked "type my own", whatever arrives next IS the answer.
+    q = load_question()
+    if q and q.get("awaiting_text"):
+        answer_question(rest if session_hint else msg, forced=session_hint)
+        return
+
+    # ── a pending multiple-choice question takes priority ──
+    if is_opts and answer_question(rest, forced=session_hint):
+        return
+    if session_hint is None and answer_question(msg):
+        return
+
+    # ── quick permission answers, without needing a session ──
+    perm = pending_permission()
+    if perm:
+        if low in ("y", "yes", "ok", "okay", "once", "allow", "approve", "1"):
+            if reply_permission(perm, "once"):
+                send_to_phone("Approved.", "OpenCode · reply", "white_check_mark")
+                return
+        if low in ("n", "no", "reject", "deny", "2"):
+            if reply_permission(perm, "reject"):
+                send_to_phone("Rejected.", "OpenCode · reply", "white_check_mark")
+                return
+
+    # ── otherwise treat it as a steer/prompt ──
+    if session_hint is not None:
+        if not rest:
+            # "#2" on its own says WHERE but not WHAT. Returning quietly made
+            # it indistinguishable from the bridge being down — say so.
+            send_to_phone(
+                f"Send your message after the number and it goes to "
+                f"{shorten_name(session_hint)}.\n\n"
+                f"Example:  #2 start the viator report",
+                "OpenCode · reply", "pencil")
+            return
+        msg = rest
+    if not msg:
+        return
+
+    # Priority: explicit #N, then a session that just asked us something,
+    # then a single live session. Never guess between equals.
+    target = session_hint or sticky_target() or target_session()
+    if not target:
+        roster = session_roster()
+        if roster.startswith("No sessions"):
+            send_to_phone(
+                "No session is running right now, so that was not sent.\n"
+                "Start one and send it again.",
+                "OpenCode · reply", "warning", "high")
+        else:
+            send_to_phone(
+                "Several sessions are running, so I did not guess.\n\n" + roster,
+                "OpenCode · which session?", "question")
+        return
+
+    svc = service_info()
+    if not svc:
+        return
+    base, pw = svc
+    try:
+        api(base, pw, f"/api/session/{target['id']}/prompt",
+            {"text": msg}, timeout=20)
+        # Not a binding — see deliver_text_answer() for why.
+        log(f"steered {target['title']}: {msg[:60]}")
+        if target.get("running") is False:
+            send_to_phone(f"Woke up {target['title']} (was parked "
+                          f"{target.get('idle_for') or 'a while'}) and sent it your message.",
+                          "OpenCode · session resumed", "rocket")
+        else:
+            send_to_phone(f"Sent to {target['title']}", "OpenCode · reply",
+                          "white_check_mark")
+    except Exception as exc:
+        log(f"prompt failed: {exc}")
+        send_to_phone(f"Could not send that: {exc}", "OpenCode · reply",
+                      "x", "high")
+
+# ── reply stream ───────────────────────────────────────────────────────────
+#
+# Each topic keeps its OWN cursor, encoded as "<kind>:<value>":
+#     "m:<message id>"  resume reading from just after that message
+#     "t:<epoch secs>"  a topic with no history yet starts from "now"
+#
+# A single shared cursor was wrong twice over:
+#   * ntfy's `since` is a position in its SERVER-WIDE cache, so if the poll
+#     for one topic failed while the other succeeded, the shared position
+#     could advance past the failed topic's messages — those replies were
+#     never seen again. This route fails ~90 times per 2 hours.
+#   * a topic that had ever produced no message left the cursor empty, and
+#     drain() then returned WITHOUT POLLING. The bridge would sit there
+#     running, healthy-looking, and completely dead.
+#
+# The kind prefix also keeps "message id" and "unix time" unambiguous for
+# ntfy, which accepts both in the same parameter.
+
+def _since_param(cursor: str) -> str:
+    """Stored cursor -> the value ntfy wants for `since=`."""
+    if cursor[:2] in ("m:", "t:"):
+        return cursor[2:]
+    return cursor  # plain message id written by an older build
+
+
+def load_cursors() -> dict[str, str]:
+    """topic -> cursor. Empty dict when nothing has been recorded yet."""
+    try:
+        data = json.load(open(CURSOR_FILE))
+    except Exception:
+        return {}
+    topics = data.get("topics")
+    if isinstance(topics, dict):
+        out = {str(k): str(v) for k, v in topics.items() if v}
+        if out:
+            return out
+    legacy = data.get("id")
+    if legacy:
+        return {t: f"m:{legacy}" for t in (BASE_TOPIC, REPLY_TOPIC)}
+    return {}
+
+
+def save_cursors(cursors: dict[str, str]) -> None:
+    try:
+        json.dump({"topics": cursors, "ts": time.time()},
+                  open(CURSOR_FILE, "w"))
+    except Exception:
+        pass
+
+def stream_once(cursors: dict[str, str]) -> tuple[list[dict], dict[str, str]]:
+    """
+    Read whatever is waiting. Returns (messages, newest cursor per topic).
+
+    We listen on BOTH the reply topic and the base topic. Frappppy only has
+    the base topic subscribed in the ntfy app, so anything typed there is a
+    reply. Listening to both means it works without them having to discover
+    or subscribe to a second topic — and the base-topic noise (our own
+    notifications) is filtered out by the self-talk rules below.
+
+    A topic whose poll fails simply contributes nothing and keeps the cursor
+    it came in with, so a flaky route delays a reply instead of skipping it.
+    """
+    msgs: list[dict] = []
+    newest = dict(cursors)
+
+    for topic in dict.fromkeys([REPLY_TOPIC, BASE_TOPIC]):
+        cursor = cursors.get(topic, "")
+        since = _since_param(cursor) if cursor else "1h"
+        url = f"{NTFY_SERVER}/{topic}/json?poll=1&since={urllib.parse.quote(since)}"
+        try:
+            with urllib.request.urlopen(url, timeout=20) as r:
+                lines = r.read().decode().splitlines()
+        except urllib.error.HTTPError as e:
+            log(f"poll {topic} HTTP {e.code} (cursor unchanged)")
+            continue
+        except Exception as exc:
+            log(f"poll {topic} error: {exc} (cursor unchanged)")
+            continue
+
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                m = json.loads(line)
+            except Exception:
+                continue
+            if m.get("event") != "message":
+                continue
+            if not (m.get("message") or "").strip():
+                continue
+            if is_our_own(m):
+                continue
+            msgs.append(m)
+            if m.get("id"):
+                newest[topic] = f"m:{m['id']}"
+
+    return msgs, newest
+
+def _now_cursor() -> str:
+    return f"t:{int(time.time())}"
+
+
+def seed_cursor() -> None:
+    """
+    On the FIRST EVER start, mark history as already-read.
+
+    Without this a brand-new daemon would replay cached history (old test
+    messages) as prompts. But this must happen exactly once, ever — re-seeding
+    on every restart silently swallows genuine replies, which is how two real
+    "4"s got lost during development.
+
+    Every topic gets a cursor, even an empty one: a topic that never produced
+    a message used to be left with no cursor at all, which is what stopped
+    drain() from ever polling again.
+    """
+    if os.path.exists(SEED_MARKER):
+        return  # already initialised; never re-seed
+    _, newest = stream_once({})
+    fallback = _now_cursor()
+    for topic in dict.fromkeys([REPLY_TOPIC, BASE_TOPIC]):
+        newest.setdefault(topic, fallback)
+    save_cursors(newest)
+    try:
+        open(SEED_MARKER, "w").write(str(int(time.time())))
+    except Exception:
+        pass
+    log(f"first start: cursors seeded ({', '.join(sorted(newest))})")
+
+
+def ensure_cursors() -> dict[str, str]:
+    """
+    Get to a usable starting point, never by polling blind.
+
+    Two ways we can arrive here with nothing recorded: the very first start
+    (handled by seed_cursor, which swallows history on purpose), or the state
+    file being wiped while the marker survives. In the second case we start
+    from NOW rather than re-reading the last hour — re-reading would inject
+    stale prompts back into sessions, which is a side effect we cannot undo.
+    """
+    cursors = load_cursors()
+    if cursors:
+        return cursors
+    if not os.path.exists(SEED_MARKER):
+        seed_cursor()
+    else:
+        log("cursor state missing; fast-forwarding to now")
+        save_cursors({t: _now_cursor()
+                      for t in dict.fromkeys([REPLY_TOPIC, BASE_TOPIC])})
+    return load_cursors()
+
+
+def drain(once: bool = False) -> int:
+    cursors = ensure_cursors()
+    if not cursors:
+        return 0
+    msgs, _ = stream_once(cursors)
+    if not msgs:
+        return 0
+    log(f"received {len(msgs)} reply/replies")
+    batch = msgs[:MAX_BATCH]
+    for m in batch:
+        handle_reply(m.get("message", ""))
+
+    # Advance each topic only as far as messages we ACTUALLY handled. A
+    # message past MAX_BATCH keeps its old cursor and returns next pass —
+    # moving straight to `latest` used to drop it silently.
+    updated = dict(cursors)
+    for m in batch:
+        topic, mid = m.get("topic"), m.get("id")
+        if topic and mid:
+            updated[topic] = f"m:{mid}"
+    if updated != cursors:
+        save_cursors(updated)
+    if len(msgs) > len(batch):
+        log(f"{len(msgs) - len(batch)} left for next pass")
+    return len(batch)
+
+def main() -> int:
+    global DRY
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("--once", action="store_true", help="drain and exit")
+    ap.add_argument("--dry", action="store_true", help="don't ack to phone")
+    args = ap.parse_args()
+    DRY = args.dry
+
+    if args.once:
+        drain(once=True)
+        return 0
+
+    log(f"watching {NTFY_SERVER}/{REPLY_TOPIC} (poll every 5s)")
+    backoff = 5
+    while not STOP.is_set():
+        try:
+            n = drain()
+            if n:
+                backoff = 5
+            else:
+                # nothing waiting — back off gently so we don't hammer ntfy
+                backoff = min(backoff * 1.2, 30)
+        except Exception as exc:
+            log(f"loop error: {exc}")
+            backoff = 10
+        STOP.wait(backoff)
+    log("stopped")
+    return 0
+
+def _shutdown(signum, frame):
+    STOP.set()
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
+    sys.exit(main())

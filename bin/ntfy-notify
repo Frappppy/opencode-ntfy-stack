@@ -1,0 +1,366 @@
+#!/usr/bin/env bash
+# ntfy-notify — push notifications (ntfy, with a desktop fallback)
+#
+# Quick use:
+#   ntfy-notify "message"
+#   ntfy-notify build_failed "tests failed in CI"     # template
+#   ntfy-notify -p high "tests failed"                # high priority
+#   ntfy-notify -c "https://pr" "visual diff"         # tap opens a URL
+#
+# Flags:
+#   -p <priority>     min|low|default|high|max|urgent
+#   -c <url>          click action URL
+#   -t <template>     use template: build_failed|deploy_done|error|question|info|success|warning
+#   -g <group>        group/thread key (related notifications stack)
+#   -h                help
+#
+# Config (env or ~/.config/ntfy-notify.conf — written by install.sh):
+#   NTFY_TOPIC           your topic. NO DEFAULT: it is a credential, so it
+#                        lives in the config file and never in git
+#   NTFY_SERVER          server (default: https://ntfy.sh)
+#   NTFY_AUTH            Bearer token for private topics
+#   NTFY_DEDUP_WINDOW    deduplication window seconds (default: 30)
+#
+# Templates (extend in config):
+#   build_failed    🔴 Build failed — {message}
+#   deploy_done     🟢 Deployed — {message}
+#   error           💥 Error — {message}
+#   question        ❓ Need input — {message}
+#   info            ℹ️  Info — {message}
+#   success         ✅ Done — {message}
+#   warning         ⚠️  Warning — {message}
+
+set -uo pipefail
+
+# ── load config ─────────────────────────────────────────────────────────
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/ntfy-notify.conf"
+[[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+
+# Config is sourced above, so TOPIC comes from the environment or from
+# ~/.config/ntfy-notify.conf. There is deliberately no fallback: the topic is
+# a credential, and a hardcoded one in a public repo would let anyone read and
+# post to your notifications. Missing config is caught before the first send.
+TOPIC="${NTFY_TOPIC:-}"
+SERVER="${NTFY_SERVER:-https://ntfy.sh}"
+AUTH="${NTFY_AUTH:-}"
+DEDUP_WINDOW="${NTFY_DEDUP_WINDOW:-30}"
+
+# This host's route to ntfy.sh drops packets intermittently (measured ~10-40%
+# of connects), so the per-attempt timeout is deliberately short. MAX_ATTEMPTS
+# and BASE_BACKOFF are decided per message in the send loop below.
+CURL_TIMEOUT=8
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/ntfy-notify"
+mkdir -p "$STATE_DIR"
+CIRCUIT_FILE="$STATE_DIR/circuit"
+METRICS_FILE="$STATE_DIR/metrics.log"
+DEDUP_FILE="$STATE_DIR/dedup.log"
+PUBLISH_BLOCKED="$STATE_DIR/publish_blocked"
+LAST_RESPONSE="$STATE_DIR/last_response"
+
+# ── templates ───────────────────────────────────────────────────────────
+declare -A TEMPLATES=(
+  [build_failed]="🔴 Build failed — {msg}"
+  [deploy_done]="🟢 Deployed — {msg}"
+  [error]="💥 Error — {msg}"
+  [question]="❓ Need input — {msg}"
+  [info]="ℹ️ Info — {msg}"
+  [success]="✅ Done — {msg}"
+  [warning]="⚠️ Warning — {msg}"
+)
+
+# ── usage ───────────────────────────────────────────────────────────────
+usage() {
+  cat <<'EOF'
+ntfy-notify [-p priority] [-c click_url] [-t template] [-g group] "message" [title] [tag]
+
+  -p  priority: min low default high max urgent
+  -c  URL to open when tapped
+  -t  template: build_failed|deploy_done|error|question|info|success|warning
+  -g  group key (threads related notifications)
+  -h  help
+
+Examples:
+  ntfy-notify build_failed "tests failed on main"
+  ntfy-notify -p high "tests failed" "OpenCode" warning
+  ntfy-notify -c "https://github.com/me/repo/pull/5" -g pr-5 "Review needed"
+EOF
+  # -h passes 0: scripts check the exit status, and "I asked for help" is
+  # not an error. Bad usage still exits 2.
+  exit "${1:-2}"
+}
+
+# ── helpers ─────────────────────────────────────────────────────────────
+log_metric() {
+  local status=$1 attempt=$2 http_code=$3 elapsed_ms=$4
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$(date -Is)" "$TOPIC" "$status" "$attempt" "$http_code" "$elapsed_ms" \
+    >>"$METRICS_FILE"
+}
+
+circuit_open() {
+  [[ -f "$CIRCUIT_FILE" ]] && (( $(date +%s) - $(cat "$CIRCUIT_FILE") < 300 ))
+}
+
+circuit_trip() {
+  date +%s >"$CIRCUIT_FILE"
+}
+
+circuit_reset() {
+  rm -f "$CIRCUIT_FILE"
+}
+
+# A refusal that named a reason (the daily quota) will not clear on its own,
+# so looping against it only burns the caller's timeout: up to 8 x 8s spent
+# waiting on a counter that resets once a day. One attempt still proves it,
+# and still succeeds if the counter has just rolled over.
+publish_blocked_recent() {
+  [[ -f "$PUBLISH_BLOCKED" ]] || return 1
+  local ts
+  ts=$(head -n1 "$PUBLISH_BLOCKED" 2>/dev/null) || return 1
+  [[ "$ts" =~ ^[0-9]+$ ]] || return 1
+  (( $(date +%s) - ts < 3600 ))
+}
+
+# deduplication: hash message+title+tag, suppress if we DELIVERED it recently
+#
+# The check and the record used to be one function, which wrote the hash
+# before the send was even attempted. A message that then failed every
+# attempt had marked itself sent, so an immediate retry was swallowed as a
+# "duplicate" — the one case where a retry is most needed.
+_dedup_hash() {
+  printf '%s' "$1" | sha256sum | cut -d' ' -f1
+}
+
+# return 0 = a copy of this message went out within the window
+dedup_check() {
+  local hash now cutoff
+  hash=$(_dedup_hash "$1")
+  now=$(date +%s)
+  cutoff=$((now - DEDUP_WINDOW))
+  [[ -f "$DEDUP_FILE" ]] || return 1
+  # awk exits 0 when a matching recent hash exists
+  awk -F'\t' -v h="$hash" -v c="$cutoff" \
+      '$1 == h && $2 >= c {found=1} END {exit(found ? 0 : 1)}' \
+      "$DEDUP_FILE" 2>/dev/null
+}
+
+# record it, and prune entries older than the window. Two ntfy-notify
+# processes can run at once (heartbeat + events), so the append and the prune
+# are locked together — otherwise one rewrites the file from a stale read and
+# drops the other's entry.
+dedup_record() {
+  local hash now cutoff
+  hash=$(_dedup_hash "$1")
+  now=$(date +%s)
+  cutoff=$((now - DEDUP_WINDOW))
+  {
+    flock 9
+    printf '%s\t%s\n' "$hash" "$now" >>"$DEDUP_FILE"
+    if awk -F'\t' -v c="$cutoff" '$2 >= c' "$DEDUP_FILE" \
+         >"$DEDUP_FILE.tmp" 2>/dev/null; then
+      mv "$DEDUP_FILE.tmp" "$DEDUP_FILE"
+    else
+      rm -f "$DEDUP_FILE.tmp"
+    fi
+  } 9>>"$DEDUP_FILE.lock"
+}
+
+# desktop fallback
+desktop_fallback() {
+  if command -v notify-send >/dev/null 2>&1; then
+    notify-send -u normal -i dialog-information "$title" "$message" 2>/dev/null
+  elif command -v osascript >/dev/null 2>&1; then
+    osascript -e "display notification \"$message\" with title \"$title\"" 2>/dev/null
+  fi
+}
+
+send_one() {
+  # No -f: with it curl throws away the response body on an error, and that
+  # body is the ONLY place ntfy says why it refused us (e.g. "daily message
+  # quota reached"). Success is decided from the status code instead.
+  local curl_args=(-4 -sS -m "$CURL_TIMEOUT" -o "$LAST_RESPONSE" -w "%{http_code}")
+
+  [[ -n "$AUTH" ]] && curl_args+=(-H "Authorization: Bearer $AUTH")
+
+  curl_args+=(-H "Title: $title" -H "Priority: $priority" -H "Tags: $tag")
+  [[ -n "$click_url" ]] && curl_args+=(-H "Click: $click_url")
+  [[ -n "$group" ]] && curl_args+=(-H "Group: $group")
+
+  curl_args+=(-d "$message")
+
+  # stderr is deliberately left alone: -sS already silences progress, and
+  # hiding curl's error meant every failure was an unexplained "000".
+  local code
+  code=$(curl "${curl_args[@]}" "$SERVER/$TOPIC")
+  local rc=$?
+  printf '%s' "$code"
+  [[ $rc -eq 0 && "$code" == 2?? ]]
+}
+
+# ── parse flags ────────────────────────────────────────────────────────
+priority="default"
+click_url=""
+template=""
+group=""
+
+while getopts ":p:c:t:g:h" opt; do
+  case $opt in
+    p) priority="$OPTARG" ;;
+    c) click_url="$OPTARG" ;;
+    t) template="$OPTARG" ;;
+    g) group="$OPTARG" ;;
+    h) usage 0 ;;
+    \?) echo "Invalid option: -$OPTARG" >&2; usage ;;
+    :) echo "Option -$OPTARG requires an argument" >&2; usage ;;
+  esac
+done
+shift $((OPTIND-1))
+
+# template handling
+if [[ -n "$template" ]]; then
+  if [[ -n "${TEMPLATES[$template]:-}" ]]; then
+    message="${1:-}"
+    message="${TEMPLATES[$template]//\{msg\}/$message}"
+    title="${2:-$(tr '[:lower:]' '[:upper:]' <<<${template:0:1})${template:1}}"
+    tag="${3:-$template}"
+  else
+    echo "Unknown template: $template" >&2
+    usage
+  fi
+else
+  message="${1:-}"
+  title="${2:-OpenCode}"
+  tag="${3:-robot}"
+fi
+
+[[ -n "$message" ]] || usage
+
+# No topic, no send. Checked here rather than at assignment so that -h still
+# works on an unconfigured machine, and so the error names the file to fix
+# instead of curl silently POSTing to https://ntfy.sh/ and failing with 404.
+if [[ -z "$TOPIC" || "$TOPIC" == REPLACE_* ]]; then
+  echo "ntfy-notify: no topic configured." >&2
+  echo "  Set NTFY_TOPIC, or run install.sh to write $CONFIG_FILE." >&2
+  exit 2
+fi
+
+# deduplication
+dedup_key="${title}|${message}|${tag}"
+if dedup_check "$dedup_key"; then
+  echo "Suppressed duplicate notification (within ${DEDUP_WINDOW}s)" >&2
+  exit 0
+fi
+
+# ── main send loop ──────────────────────────────────────────────────────
+start_epoch=$(date +%s%3N)
+attempt=1
+
+# The circuit breaker exists to stop us hammering a dead endpoint during
+# routine chatter. It must NOT silence important alerts: a health warning or
+# an approval request is rare and time-critical, so those always try.
+critical=false
+case "$priority" in
+  high|urgent) critical=true ;;
+esac
+
+# Important messages get more persistence, not less.
+#
+# Routine messages get FEWER attempts on purpose. This route drops packets,
+# and a client-side timeout does not prove the server did not receive the
+# message — so every extra retry risks a second identical notification. For a
+# routine ping the cost of a miss is low (the next one arrives in minutes and
+# the heartbeat re-reads live state), while a duplicate is something the human
+# notices immediately. Critical messages invert that trade-off.
+#
+# An open circuit DEGRADES to one attempt instead of skipping the send.
+# Skipping did `exit 0`, and ntfy-heartbeat reads exit 0 as "delivered" — it
+# then cleared pending.txt and committed state, so the queued event was gone
+# without ever reaching the phone. 15 circuit trips were logged that way.
+if publish_blocked_recent; then
+  MAX_ATTEMPTS=1
+  BASE_BACKOFF=1
+  log_metric "publish_blocked" 0 "-" 0
+  echo "Publish refused within the last hour — single attempt" >&2
+elif $critical; then
+  MAX_ATTEMPTS=8
+  BASE_BACKOFF=2
+elif circuit_open; then
+  MAX_ATTEMPTS=1
+  BASE_BACKOFF=1
+  log_metric "circuit_open" 0 "-" 0
+  echo "Circuit open — single degraded attempt" >&2
+else
+  MAX_ATTEMPTS=3
+  BASE_BACKOFF=1
+fi
+
+# Bound the WHOLE send, not just each attempt.
+#
+# Every caller runs this under subprocess.run(..., timeout=120), and the
+# critical path could take 8 x 8s of timeouts plus 254s of backoff = 318s.
+# The caller killed us mid-send, logged "handler error" and the notification
+# was lost — a retry loop that outlives its caller is worse than no retry
+# loop. The budget always leaves room for a final full attempt, so a critical
+# message still gets up to five real tries inside the caller's window.
+if $critical; then
+  SEND_DEADLINE=$(( $(date +%s) + 90 ))
+else
+  SEND_DEADLINE=$(( $(date +%s) + 30 ))
+fi
+
+while (( attempt <= MAX_ATTEMPTS )); do
+  send_start=$(date +%s%3N)
+  if http_code=$(send_one); then
+    send_end=$(date +%s%3N)
+    elapsed=$((send_end - send_start))
+    echo "notified (HTTP $http_code, attempt $attempt): $title"
+    log_metric "success" "$attempt" "$http_code" "$elapsed"
+    dedup_record "$dedup_key"
+    rm -f "$PUBLISH_BLOCKED"
+    circuit_reset
+    exit 0
+  fi
+
+  send_end=$(date +%s%3N)
+  elapsed=$((send_end - send_start))
+  # http_code is what curl actually reported (000 = never reached the
+  # server); hardcoding "000" here threw that away.
+  log_metric "fail" "$attempt" "${http_code:-000}" "$elapsed"
+
+  if (( attempt < MAX_ATTEMPTS )); then
+    backoff=$(( BASE_BACKOFF * (1 << (attempt - 1)) ))
+    jitter=$(( RANDOM % (backoff / 2 + 1) ))
+    if (( $(date +%s) + backoff + CURL_TIMEOUT >= SEND_DEADLINE )); then
+      echo "stopping: send budget exhausted after $attempt attempt(s)" >&2
+      break
+    fi
+    sleep $(( backoff + jitter ))
+  fi
+  ((attempt++))
+done
+
+# all remote failed
+total_elapsed=$(( $(date +%s%3N) - start_epoch ))
+# Report the attempts actually made, not the configured maximum: a send cut
+# short by the budget above reported "after 8 attempts" when it had stopped
+# at 5, which is exactly the kind of number that sends you debugging the
+# wrong thing.
+tried=$attempt
+(( tried > MAX_ATTEMPTS )) && tried=$MAX_ATTEMPTS
+echo "FAILED after $tried attempt(s) (${total_elapsed}ms, last HTTP ${http_code:-000}): $title" >&2
+log_metric "exhausted" "$tried" "${http_code:-000}" "$total_elapsed"
+
+# ntfy-health probes with GET, which keeps returning 200 while ntfy.sh
+# refuses our PUBLISHES with 429 — so without this the watchdog rates a
+# channel that can deliver nothing as "reachable". Cleared by the next
+# successful publish.
+if [[ "${http_code:-}" == "429" ]]; then
+  printf '%s\n%s\n' "$(date +%s)" \
+    "$(head -c 300 "$LAST_RESPONSE" 2>/dev/null | tr -d '\n')" >"$PUBLISH_BLOCKED"
+fi
+
+circuit_trip
+
+# last resort when every attempt failed: a desktop notification on this box
+desktop_fallback
+exit 1

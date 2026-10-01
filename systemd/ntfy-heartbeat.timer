@@ -1,0 +1,20 @@
+[Unit]
+Description=Ping phone every 15 min with what OpenCode sessions are doing
+
+[Timer]
+# First run shortly after login, then repeat.
+OnBootSec=1min
+# 15 min, not 7: ntfy.sh's free tier allows 250 messages/day per IP, and the
+# stack was delivering ~256/day — heartbeats alone were 162 of them, so the
+# channel went full around midday and every later notification was refused
+# with 429 "daily message quota reached". At 15 min heartbeats drop to ~76/day,
+# leaving ~80/day of headroom for events (turn ends, questions, findings).
+OnUnitActiveSec=15min
+# Do not fire while the machine is asleep; catch up on wake instead.
+Persistent=true
+# Absorb minor scheduling jitter so we do not drift.
+AccuracySec=30s
+Unit=ntfy-heartbeat.service
+
+[Install]
+WantedBy=timers.target

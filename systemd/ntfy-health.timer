@@ -1,0 +1,11 @@
+[Unit]
+Description=Check OpenCode/ntfy health every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Unit=ntfy-health.service
+
+[Install]
+WantedBy=timers.target

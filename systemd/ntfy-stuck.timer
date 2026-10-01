@@ -1,0 +1,11 @@
+[Unit]
+Description=Check for stuck sessions every 3 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=3min
+AccuracySec=20s
+Unit=ntfy-stuck.service
+
+[Install]
+WantedBy=timers.target

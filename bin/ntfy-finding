@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+"""
+ntfy-finding — log a security finding to a structured inbox and alert.
+
+Bounty write-ups are painful to reconstruct from memory, and the evidence is
+already in the session. This appends a finding in a fixed, greppable shape
+and pushes a short summary to the phone, so "something landed" is never
+mistaken for "still thinking".
+
+Storage: one JSON object per line in
+  ~/.local/state/ntfy-heartbeat/findings.jsonl
+plus a Markdown mirror written on demand by `export`.
+
+Usage:
+  ntfy-finding -t "Deep link takeover" -s high -a "com.viator.app" \
+              -d "manifest exports host handler; attacker domain is accepted" \
+              -e "adb shell am start -a VIEW -d 'viator://evil.tld'"
+  ntfy-finding list
+  ntfy-finding list -s high              # only high findings
+  ntfy-finding show 3                    # numbering comes from `list`
+  ntfy-finding export reports/findings.md
+  ntfy-finding --session-only            # log it, but do not push to the phone
+
+`-s` is the severity of a finding when logging, and a filter when reading
+back. Pass the same -s to list and show so their numbering agrees.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ntfy_oc as oc
+
+STORE = os.path.join(oc.STATE_DIR, "findings.jsonl")
+SEVERITIES = ("info", "low", "medium", "high", "critical")
+NOTIFY = oc.NOTIFY
+
+
+def load() -> list[dict]:
+    if not os.path.exists(STORE):
+        return []
+    out = []
+    with open(STORE) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except Exception:
+                continue
+    return out
+
+
+def append(f: dict) -> None:
+    os.makedirs(os.path.dirname(STORE), exist_ok=True)
+    with open(STORE, "a") as fh:
+        fh.write(json.dumps(f) + "\n")
+
+
+def current_session() -> dict:
+    """
+    Which session a finding belongs to.
+
+    A running session is the obvious answer. With none running, fall back to
+    the most recently touched session so a finding logged after the fact
+    still lands on the right thread.
+    """
+    running = oc.running_sessions()
+    if running:
+        return running[0]
+    all_s = oc.all_sessions()
+    return all_s[0] if all_s else {"id": "", "title": "unknown"}
+
+
+def render_md(findings: list[dict]) -> str:
+    lines = ["# Findings inbox", "",
+             f"{len(findings)} finding(s), newest last.", ""]
+    for i, f in enumerate(findings, 1):
+        lines.append(f"## {i}. [{f.get('severity','?')}] {f.get('title','(untitled)')}")
+        lines.append("")
+        lines.append(f"- Target: {f.get('target') or '—'}")
+        lines.append(f"- Session: {f.get('session_title','—')}")
+        lines.append(f"- Logged: {f.get('created_human','—')}")
+        if f.get("detail"):
+            lines.append("")
+            lines.append(f"{f['detail']}")
+        if f.get("evidence"):
+            lines.append("")
+            lines.append("```")
+            lines.append(f["evidence"])
+            lines.append("```")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("-t", "--title", help="short finding title")
+    # default is None, not "medium": with a real default, `-s` could not be
+    # told apart from "not given", so `list --severity high` silently
+    # printed every finding while the docs promised a filter. Logging
+    # defaults to medium at the point of use instead.
+    ap.add_argument("-s", "--severity", default=None, choices=SEVERITIES)
+    ap.add_argument("-a", "--target", default="", help="app/host/package")
+    ap.add_argument("-d", "--detail", default="", help="what the bug is")
+    ap.add_argument("-e", "--evidence", default="", help="repro steps / proof")
+    ap.add_argument("--session-only", action="store_true",
+                    help="log only to the store, no phone notification")
+    ap.add_argument("cmd", nargs="?", choices=["list", "show", "export"],
+                    help="read back instead of logging")
+    ap.add_argument("arg", nargs="?", help="index for show, path for export")
+    ap.add_argument("--severity-filter", default=None, choices=SEVERITIES)
+    args = ap.parse_args()
+    severity = args.severity or "medium"
+
+    def rows_for_readback() -> list[dict]:
+        """Store rows, honouring the same filter for list and show."""
+        rows = load()
+        flt = args.severity_filter or args.severity
+        if flt:
+            rows = [r for r in rows if r.get("severity") == flt]
+        return rows
+
+    if args.cmd == "list":
+        rows = rows_for_readback()
+        if not rows:
+            print("no findings logged yet")
+            return 0
+        for i, r in enumerate(rows, 1):
+            print(f"{i:3}. [{r.get('severity','?'):8}] {r.get('title','(untitled)')}")
+        return 0
+
+    if args.cmd == "show":
+        rows = rows_for_readback()
+        try:
+            n = int(args.arg or "")
+        except ValueError:
+            n = 0
+        # int(...) - 1 would be -1 with no/zero argument, and rows[-1] then
+        # printed the NEWEST finding and exited 0 — a typo looked like a
+        # successful lookup of something else entirely.
+        if not 1 <= n <= len(rows):
+            print(f"usage: ntfy-finding show <1..{len(rows) or 'n'}>",
+                  file=sys.stderr)
+            return 2
+        print(json.dumps(rows[n - 1], indent=2))
+        return 0
+
+    if args.cmd == "export":
+        path = args.arg or "findings.md"
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with open(path, "w") as fh:
+            fh.write(render_md(load()))
+        print(f"wrote {path}")
+        return 0
+
+    if not args.title:
+        ap.print_help()
+        return 2
+
+    sess = current_session()
+    now = time.time()
+    finding = {
+        "id": f"fnd_{int(now)}_{os.getpid()}",
+        "title": args.title,
+        "severity": severity,
+        "target": args.target,
+        "detail": args.detail,
+        "evidence": args.evidence,
+        "session_id": sess.get("id", ""),
+        "session_title": sess.get("title", ""),
+        "created": int(now * 1000),
+        "created_human": time.strftime("%Y-%m-%d %H:%M"),
+    }
+    append(finding)
+    total = len(load())
+    print(f"logged finding #{total}: [{severity}] {args.title}")
+
+    if args.session_only:
+        return 0
+    if not os.path.exists(NOTIFY):
+        return 0
+
+    icon = {"critical": "🔥", "high": "🚨", "medium": "⚠️",
+            "low": "🔎", "info": "ℹ️"}.get(severity, "•")
+    body = [f"{icon} {severity.upper()}: {args.title}"]
+    if args.target:
+        body.append(f"  target: {args.target}")
+    if args.detail:
+        body.append(f"  {activity_gist(args.detail)}")
+    body.append(f"  in: {sess.get('title','?')}")
+    prio = "urgent" if severity == "critical" else (
+        "high" if severity == "high" else None)
+    cmd = [NOTIFY, "-g", "finding"]
+    if prio:
+        cmd += ["-p", prio]
+    cmd += ["\n".join(body), "OpenCode · finding logged", "warning"]
+    try:
+        sent = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except Exception as exc:
+        print(f"logged, but the phone push failed: {exc}", file=sys.stderr)
+        return 1
+    if sent.returncode:
+        # The finding IS in the store — say so rather than looking lost.
+        print(f"logged, but the phone push failed: "
+              f"{(sent.stderr or sent.stdout).strip()[:200]}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def activity_gist(text: str, limit: int = 140) -> str:
+    t = " ".join(text.split())
+    if len(t) > limit:
+        t = t[: limit - 1].rstrip() + "…"
+    return t
+
+
+if __name__ == "__main__":
+    sys.exit(main())

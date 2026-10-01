@@ -1,0 +1,20 @@
+# ntfy-notify configuration.
+#
+# install.sh copies this to ~/.config/ntfy-notify.conf and fills in your
+# topic. That file is gitignored: THE TOPIC IS THE ONLY CREDENTIAL FOR THIS
+# STACK. Anyone who knows it can read your notifications and publish to it,
+# so it lives here and nowhere else — never in code, never in git.
+#
+# The ${VAR:-default} form is deliberate: an ambient NTFY_TOPIC must still
+# win, so the test suite can publish to scratch topics without ever reaching
+# your phone.
+
+NTFY_TOPIC="${NTFY_TOPIC:-REPLACE_WITH_YOUR_TOPIC}"
+
+# Optional overrides. ntfy-notify -h lists everything you can set here.
+#NTFY_SERVER="https://ntfy.sh"
+#NTFY_AUTH=""
+#NTFY_DEDUP_WINDOW="30"
+
+# Extra templates, merged over the built-in ones:
+#TEMPLATES[my_template]="🟠 {msg}"

@@ -1,0 +1,20 @@
+[Unit]
+Description=Keep this machine awake for remote OpenCode control
+Documentation=man:systemd-inhibit(1)
+
+[Service]
+# Type=simple (NOT oneshot): the inhibitor must stay held for the life of
+# the process. A oneshot + "sleep infinity" in ExecStartPost would block
+# `systemctl start` forever, because oneshot waits for ExecStartPost.
+Type=simple
+ExecStart=/usr/bin/systemd-inhibit --what=idle:sleep:shutdown \
+    --who="OpenCode remote control" \
+    --why="so phone pings, replies and approvals keep working" \
+    --mode=block \
+    /usr/bin/sleep infinity
+Restart=always
+RestartSec=5
+TimeoutStopSec=10
+
+[Install]
+WantedBy=default.target

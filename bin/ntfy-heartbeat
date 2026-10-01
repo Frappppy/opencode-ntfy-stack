@@ -1,0 +1,564 @@
+#!/usr/bin/env python3
+"""
+ntfy-heartbeat — periodically tell the phone which OpenCode sessions are
+actually working, and what each one is doing right now.
+
+Design:
+  * Only sessions returned by GET /api/session/active (type == "running")
+    are reported. Idle / waiting / abandoned sessions are never mentioned.
+  * All running sessions are aggregated into ONE notification.
+  * When nothing is running, nothing is sent (silence = "no news").
+  * Sessions that were running last tick and are now finished are reported
+    once, with their outcome (succeeded / failed / aborted).
+
+Usage:
+  ntfy-heartbeat              normal run (used by the systemd timer)
+  ntfy-heartbeat -n           dry run: print, do not send
+  ntfy-heartbeat -f           send even when nothing is running
+  ntfy-heartbeat --json       dump raw state for debugging
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ntfy_activity as activity
+import ntfy_oc as oc
+
+# ── paths ───────────────────────────────────────────────────────────────────
+STATE_DIR = oc.STATE_DIR
+PREV_RUNNING = os.path.join(STATE_DIR, "prev_running.json")
+ERROR_MARK = os.path.join(STATE_DIR, "last_error")
+BLOCKED_MARK = os.path.join(STATE_DIR, "blocked.json")
+PENDING = os.path.join(STATE_DIR, "pending.txt")
+NOTIFY = oc.NOTIFY
+
+MAX_MSG = 3400          # keep the phone notification from being clipped
+MAX_PROMPT = 130        # chars of the original request shown
+
+os.makedirs(STATE_DIR, exist_ok=True)
+
+# ── http / db ───────────────────────────────────────────────────────────────
+# Aliases rather than wrapper defs: a local `def x(): return oc.x()` implies
+# a second implementation exists. ntfy_oc is the only one.
+service_info = oc.service_info
+db = oc.db
+
+def api_get(base: str, pw: str, path: str, timeout: float = 8.0) -> dict:
+    """GET a path on the OpenCode API (thin wrapper over ntfy_oc)."""
+    return oc.api(base, pw, path, timeout=timeout)
+
+# ── "is anything blocked waiting on YOU" ────────────────────────────────────
+def needs_you(base: str, pw: str, sessions: list[dict]) -> list[str]:
+    """
+    Sessions that are stalled on the human: permission prompts, forms and
+    inbox items. These are NOT 'running', so the normal filter would hide
+    them — but they are exactly when the phone should buzz.
+    """
+    out: list[str] = []
+    by_id = {s["id"]: s for s in sessions}
+    who = lambda sid: (by_id.get(sid) or {}).get("title") or "a session"
+
+    try:
+        # Correct endpoint is /api/permission/request — the dotted
+        # /api/permission.request.list form 404s, which silently made this
+        # whole block dead code (every prompt was swallowed by the except).
+        perms = (api_get(base, pw, "/api/permission/request") or {}).get("data") or []
+        for p in perms:
+            title = p.get("title") or p.get("type") or "permission"
+            out.append(f"🔐 {who(p.get('sessionID'))}: {clip(str(title), 90)}")
+    except Exception:
+        pass
+
+    # forms/inbox are per-session; only probe sessions that exist
+    for sid in list(by_id):
+        for path, icon, label in (
+            ("/api/session/{}/form", "📝", "form"),
+            ("/api/session/{}/inbox", "📥", "inbox"),
+        ):
+            try:
+                items = (api_get(base, pw, path.format(sid)) or {}).get("data") or []
+            except Exception:
+                continue
+            if items:
+                out.append(f"{icon} {who(sid)}: {len(items)} {label} waiting for reply")
+
+    return out
+
+# ── formatting helpers ──────────────────────────────────────────────────────
+def age(ms: int | None) -> str:
+    if not ms:
+        return "?"
+    # int() both ways: a float ms would otherwise render as "5.0s ago"
+    secs = int(max(0, (now_ms() - int(ms)) // 1000))
+    if secs < 60:
+        return f"{secs}s ago"
+    if secs < 3600:
+        return f"{secs // 60}m ago"
+    return f"{secs // 3600}h ago"
+
+def now_ms() -> int:
+    return int(time.time() * 1000)
+
+def clip(s: str, n: int) -> str:
+    s = " ".join(s.split())
+    return s if len(s) <= n else s[: n - 1].rstrip() + "…"
+
+def short_dir(path: str) -> str:
+    home = os.path.expanduser("~")
+    p = path.replace(home, "~") if path.startswith(home) else path
+    return os.path.basename(p.rstrip("/")) or p
+
+# ── "what is this session doing right now" ──────────────────────────────────
+def pick_activity(items: list[dict]) -> tuple[str, str]:
+    """
+    Return (icon, plain-English text) for what a session is doing.
+
+    Intentionally hides commands, file paths and tool arguments — a phone
+    notification should say "Searching the code", not the grep that did it.
+
+    An empty phrase is mapped to the "nothing to report" marker: plain_working
+    can return "" and the caller only skips its own placeholder strings, so
+    "" used to be accepted and rendered as a bare "🛠  · 3s ago".
+    """
+    return ("🛠", activity.plain_working(items) or "no update yet")
+
+def session_snapshot(con, sid: str) -> dict:
+    """Freshness + current activity + last request, straight from the DB."""
+    out = {"activity": ("⏳", "no messages yet"), "prompt": "", "last_ms": None}
+
+    rows = con.execute(
+        "select time_updated, data from session_message "
+        "where session_id=? order by time_updated desc limit 6",
+        (sid,),
+    ).fetchall()
+    if not rows:
+        return out
+    out["last_ms"] = rows[0][0]
+
+    # newest message first: the freshest message that actually says something
+    # wins, so an empty reasoning stub can't blank out the update.
+    for _, data in rows:
+        try:
+            items = json.loads(data).get("content") or []
+        except Exception:
+            continue
+        icon, text = pick_activity(items)
+        if text not in ("thinking…", "no messages yet", ""):
+            out["activity"] = (icon, text)
+            break
+
+    # The original request, so the update says what the task is. Stripped to
+    # a short gist — the full prompt is often long and technical.
+    row = con.execute(
+        "select data from session_message "
+        "where session_id=? and type='user' order by seq desc limit 1",
+        (sid,),
+    ).fetchone()
+    if row:
+        try:
+            d = json.loads(row[1])
+            txt = d.get("text") or d.get("metadata", {}).get("displayText") or ""
+            out["prompt"] = prompt_gist(txt)
+        except Exception:
+            pass
+    return out
+
+def prompt_gist(txt: str) -> str:
+    """First sentence of the request, short and plain."""
+    if not txt:
+        return ""
+    t = " ".join(txt.split())
+    # skip noisy "Attached file:" preambles
+    if t.startswith("Attached file:"):
+        return ""
+    for stop in (". ", "? ", "! ", "\n"):
+        i = t.find(stop)
+        if 0 < i < MAX_PROMPT:
+            t = t[: i + 1]
+            break
+    if len(t) > MAX_PROMPT:
+        t = t[: MAX_PROMPT - 1].rstrip() + "…"
+    return t
+
+# ── message composition ─────────────────────────────────────────────────────
+def idle_sessions() -> list[dict]:
+    """Sessions that exist but are not running, most recently touched first."""
+    try:
+        return [s for s in oc.all_sessions() if not s["running"]]
+    except Exception:
+        return []
+
+
+CARRY_MARKER = "⏳ Earlier (undelivered):"
+
+
+def strip_carryover(text: str) -> str:
+    """
+    Remove any previously-added carryover wrapper, keeping the content.
+
+    The marker is on its own line immediately before the carried content, and
+    the carried block runs until a blank line followed by the live body. Rather
+    than parse that structure, drop every marker line and collapse the blank
+    lines they leave behind — the result is the raw old body, which is what
+    we want to re-wrap exactly once.
+    """
+    out = []
+    for line in text.splitlines():
+        if line.strip() == CARRY_MARKER:
+            continue
+        out.append(line)
+    cleaned = "\n".join(out)
+    # collapse runs of blank lines
+    while "\n\n\n" in cleaned:
+        cleaned = cleaned.replace("\n\n\n", "\n\n")
+    return cleaned.strip()
+
+
+SNAPSHOT_HEADS = ("🖥", "IDLE")
+
+
+def _split_events(text: str) -> tuple[list[str], list[str]]:
+    """Split a body into (event lines, roster lines)."""
+    head: list[str] = []
+    tail: list[str] = []
+    dest = head
+    for line in text.splitlines():
+        if line.startswith(SNAPSHOT_HEADS):
+            dest = tail
+        dest.append(line)
+    return head, tail
+
+
+def dedupe_events(text: str) -> str:
+    """
+    Drop repeated event lines, keeping the roster untouched.
+
+    The carried-over events and the freshly composed ones can describe the
+    same transition — a session that flaps between running and paused gets
+    detected as "finished" on more than one tick — so concatenating them
+    can print "✅ Done: X" several times in one message, which reads as the
+    notification repeating itself. Identical event lines are the same fact
+    twice; collapse them. The roster is excluded because its lines are
+    compared only within their own section and are re-rendered live anyway.
+    """
+    head, tail = _split_events(text)
+    seen: set[str] = set()
+    out: list[str] = []
+    for line in head:
+        key = line.strip()
+        if key and key in seen:
+            continue
+        if key:
+            seen.add(key)
+        out.append(line)
+    while out and not out[-1].strip():
+        out.pop()
+    result = "\n".join(out)
+    if tail:
+        result = f"{result}\n" if result else ""
+        result += "\n".join(tail)
+    return result.strip()
+
+
+def strip_snapshot(text: str) -> str:
+    """
+    Keep only the event lines of a heartbeat, dropping the roster.
+
+    compose() builds a body as [events] + [live roster]. The roster is a
+    point-in-time snapshot that the very next tick re-renders from live
+    state, so carrying it forward is pure duplication: the phone ends up
+    showing the identical session list twice, which reads as "the same
+    message repeating itself".
+
+    Events — "🙋 I need you", "✅ Done:", "❌", "⏸" — are one-shot facts
+    that are lost if not delivered, so those are exactly what the retry
+    queue should preserve. compose() always emits them before the roster,
+    so cutting at the first roster header leaves the events.
+    """
+    return "\n".join(_split_events(text)[0]).strip()
+
+def compose(running: list[dict], finished: list[dict], blocked: list[str],
+            idle: list[dict] | None = None) -> str:
+    """
+    One screen showing everything: what is working, what just finished, and
+    what is parked. Names are the derived short labels so a phone screen
+    stays scannable — no configuration required.
+    """
+    idle = idle or []
+    lines: list[str] = []
+
+    if blocked:
+        lines.append("🙋 I need you:")
+        lines.extend(f"  {b}" for b in blocked)
+
+    for s in finished:
+        outcome = s.get("outcome") or "finished"
+        mark = "✅" if outcome == "succeeded" else ("❌" if outcome in ("failed", "aborted") else "⏸")
+        name = oc.shorten(s.get("title") or short_dir(s.get("directory", "")))
+        lines.append(f'{mark} Done: {name} ({outcome})')
+
+    if running:
+        if lines:
+            lines.append("")
+        n = len(running)
+        lines.append(f'🖥 {n} session{"s" if n != 1 else ""} working right now')
+    for i, s in enumerate(running, 1):
+        name = oc.shorten(s.get("title") or short_dir(s.get("directory", "")))
+        icon, text = s["activity"]
+        lines.append("")
+        lines.append(f'#{i}  {name}')
+        lines.append(f'  {icon} {text} · {age(s["last_ms"])}')
+
+    if idle:
+        if lines:
+            lines.append("")
+        lines.append("IDLE")
+        base = len(running)
+        # Every idle session is listed — no truncation.
+        for j, s in enumerate(idle, base + 1):
+            lines.append(f'#{j}  {oc.shorten(s.get("title") or "")}  '
+                         f'{s.get("idle_for", "idle")}')
+
+    return "\n".join(lines)
+
+def commit_state(running_ids: list[str], by_id: dict, blocked: list[str]) -> None:
+    """
+    Persist "what we already told the human".
+
+    Called ONLY after the message is sent or queued. Calling it earlier meant
+    `ntfy-heartbeat -n` / `--json` (dry runs, debugging) recorded the
+    transition as delivered without ever notifying — which is why completions
+    were being swallowed: each dry run burned the one-shot "session finished"
+    event.
+    """
+    try:
+        json.dump({sid: by_id[sid].get("title", "") for sid in running_ids if sid in by_id},
+                  open(PREV_RUNNING, "w"))
+    except Exception:
+        pass
+
+    try:
+        if blocked:
+            open(BLOCKED_MARK, "w").write(json.dumps(sorted(blocked)))
+        elif os.path.exists(BLOCKED_MARK):
+            os.remove(BLOCKED_MARK)
+    except Exception:
+        pass
+
+# ── main ────────────────────────────────────────────────────────────────────
+def main() -> int:
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("-n", "--dry-run", action="store_true", help="print only")
+    ap.add_argument("-f", "--force", action="store_true", help="send even when idle")
+    ap.add_argument("--json", action="store_true", help="raw JSON dump")
+    args = ap.parse_args()
+
+    svc = service_info()
+    if not svc:
+        # OpenCode isn't running — stay silent, there is nothing to report.
+        print("opencode service not running; skipping", file=sys.stderr)
+        return 0
+    base, pw = svc
+
+    try:
+        active = (api_get(base, pw, "/api/session/active") or {}).get("data") or {}
+        sessions = (api_get(base, pw, "/api/session") or {}).get("data") or []
+    except Exception as exc:
+        # don't spam the phone because the API hiccupped
+        stamp = str(now_ms() // 300_000)  # one warning per 5 min at most
+        if not os.path.exists(ERROR_MARK) or open(ERROR_MARK).read() != stamp:
+            open(ERROR_MARK, "w").write(stamp)
+            print(f"API error: {exc}", file=sys.stderr)
+        return 1
+
+    if os.path.exists(ERROR_MARK):
+        os.remove(ERROR_MARK)
+
+    running_ids = [sid for sid, st in active.items()
+                   if isinstance(st, dict) and st.get("type") == "running"]
+
+    by_id = {s["id"]: s for s in sessions}
+
+    # Anything blocked on the human — this is the "ping me when you need me"
+    # case, and it must be reported even when no session is 'running'.
+    blocked = needs_you(base, pw, sessions)
+
+    # A standing permission prompt stays visible across ticks, so only
+    # announce it when the SET of blocked items actually changes.
+    blocked_key = json.dumps(sorted(blocked))
+    seen_blocked = ""
+    if os.path.exists(BLOCKED_MARK):
+        try:
+            seen_blocked = open(BLOCKED_MARK).read()
+        except Exception:
+            seen_blocked = ""
+    blocked_changed = blocked_key != seen_blocked
+    # NOTE: BLOCKED_MARK is only written once we actually SEND (see
+    # commit_state() below). Writing it here meant `ntfy-heartbeat -n`
+    # silently consumed a "needs your input" alert that was never delivered.
+    new_blocked = blocked if blocked_changed else []
+
+    # which ones were running on the previous tick → catch completions
+    prev = {}
+    if os.path.exists(PREV_RUNNING):
+        try:
+            prev = json.load(open(PREV_RUNNING))
+        except Exception:
+            prev = {}
+    now_ids = set(running_ids)
+    finished = [
+        by_id[sid] for sid in set(prev) - now_ids if sid in by_id
+    ]
+    # PREV_RUNNING is written only after a real send (see commit_state()).
+
+    if args.json:
+        print(json.dumps({"running": running_ids,
+                          "finished": [f.get("title") for f in finished],
+                          "needs_you": blocked,
+                          "announce_blocked": new_blocked}, indent=2))
+        return 0
+
+    # Silence only when there is genuinely nothing to say: no running work,
+    # no completed work, and no NEW request for the human.
+    if not running_ids and not finished and not new_blocked and not args.force:
+        print("no active sessions; staying silent")
+        return 0
+
+    # snapshot each running session
+    rows = []
+    try:
+        con = db()
+        for sid in running_ids:
+            meta = by_id.get(sid, {})
+            snap = session_snapshot(con, sid)
+            rows.append({
+                "id": sid,
+                "title": meta.get("title"),
+                "directory": meta.get("directory", ""),
+                "outcome": meta.get("outcome"),
+                **snap,
+            })
+        con.close()
+    except Exception as exc:
+        print(f"db error: {exc}", file=sys.stderr)
+        rows = [{"id": s["id"], "title": s.get("title"),
+                 "directory": s.get("directory", ""),
+                 "outcome": s.get("outcome"),
+                 "activity": ("⏳", "state unavailable"), "prompt": "",
+                 "last_ms": None} for s in [by_id.get(i, {"id": i}) for i in running_ids]]
+
+    # sort: freshest activity first
+    rows.sort(key=lambda r: r.get("last_ms") or 0, reverse=True)
+
+    body = compose(rows, finished, new_blocked, idle_sessions())
+
+    # Re-deliver anything a previous tick failed to push: a flaky network
+    # should delay an update, never silently swallow it.
+    #
+    # The stored text may already contain an "Earlier (undelivered)" block
+    # from the send that failed last time — it was written AFTER the wrapper
+    # was added. Re-wrapping it verbatim nested another copy on every failure,
+    # which is what produced the phone showing the same block three times.
+    # Strip any existing markers so exactly one is ever shown.
+    if os.path.exists(PENDING):
+        try:
+            # Both filters, defensively: queued text written by an older
+            # build may still be wrapped, and anything roster-shaped is
+            # stale by construction.
+            old = strip_snapshot(strip_carryover(open(PENDING).read()))
+        except Exception:
+            old = ""
+        if old:
+            body = f"⏳ Earlier (undelivered):\n{old}\n\n{body}"
+
+    # NOTE: PENDING is deliberately NOT deleted here. It is read above and
+    # only cleared once the composed message has actually been delivered —
+    # deleting it at read time made `ntfy-heartbeat -n` swallow queued
+    # events it never sent. A failed send overwrites PENDING with the same
+    # content (old included), so nothing is lost either way.
+
+    # The carried events and the live ones can describe the same transition,
+    # so collapse repeats before anything is shown or re-queued.
+    body = dedupe_events(body)
+
+    if len(body) > MAX_MSG:
+        body = body[: MAX_MSG - 1] + "…"
+
+    title = "OpenCode"
+    tag = "robot"
+    prio = None
+
+    # "I need you" outranks everything: it is the one case where silence
+    # would actually cost you time.
+    if new_blocked:
+        title = "OpenCode · needs your input"
+        tag = "hand"
+        prio = "urgent"
+    if rows and not new_blocked:
+        title = f"OpenCode · {len(rows)} working"
+    if any((f.get("outcome") or "") not in ("succeeded", "") for f in finished):
+        title = "OpenCode · task failed"
+        tag = "x"
+        prio = prio or "high"
+    elif finished and not new_blocked:
+        title = f"OpenCode · {finished[0].get('title') or 'task'} done"
+        tag = "white_check_mark"
+
+    print(body)
+    if args.dry_run:
+        return 0
+
+    if not os.path.exists(NOTIFY):
+        print(f"missing {NOTIFY}", file=sys.stderr)
+        return 1
+
+    cmd = [NOTIFY, "-g", "heartbeat"]
+    if prio:
+        cmd += ["-p", prio]
+    cmd += [body, title, tag]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if not res.returncode:
+        # Delivered: the queued text has just gone out inside `body`, so the
+        # queue can be cleared now. This is the only place it is cleared.
+        try:
+            if os.path.exists(PENDING):
+                os.remove(PENDING)
+        except Exception:
+            pass
+    if res.returncode:
+        # Network is down or rate-limited. Stash the update so the next
+        # tick delivers it, and exit 0 so systemd doesn't log a failure —
+        # a flaky route is expected here, not an error condition.
+        #
+        # Store the body with any existing carryover wrapper STRIPPED. The
+        # body may already contain a carried-over block from a previous
+        # failure; saving it verbatim meant the next tick wrapped that
+        # already-wrapped text again, and the phone showed the same block
+        # three times deep.
+        try:
+            # Store events only: strip the wrapper so it cannot nest, and
+            # strip the roster because the next tick re-renders it from live
+            # state — re-sending it is what made the phone show the same
+            # session list twice.
+            open(PENDING, "w").write(strip_snapshot(strip_carryover(body)))
+            print("send failed; queued for next tick", file=sys.stderr)
+        except Exception:
+            pass
+        print((res.stderr or res.stdout).strip(), file=sys.stderr)
+        # Queued counts as delivered: the transition is now carried in PENDING,
+        # so recording it here stops the next tick from re-reporting it.
+        commit_state(running_ids, by_id, blocked)
+        return 0
+
+    commit_state(running_ids, by_id, blocked)
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())

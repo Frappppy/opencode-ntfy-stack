@@ -1,0 +1,207 @@
+#!/usr/bin/env python3
+"""
+ntfy-ask — ask Frappppy a multiple-choice question on their phone.
+
+Asks a question with numbered options. The reply bridge watches the reply
+topic and turns "2,3" into a real answer that goes back into the session.
+
+This exists because ntfy has no native multi-select UI, and OpenCode's own
+form API would have to block the session while it waits. Numbered options in
+the message body are the reliable option: the question is just a prompt plus a
+pending record, and answering is an ordinary prompt back.
+
+Usage:
+  ntfy-ask "Which target should I test first?" "App deeplinks|API auth|WebView"
+  ntfy-ask -t "Choose focus areas" "Which should I chase?"
+                            "Insecure storage|Deep links|TLS pinning"
+  ntfy-ask --pending            # show the question waiting for an answer
+  ntfy-ask --cancel             # forget it
+
+Options in the message are separated by "|". Answers are comma-separated
+numbers: "1,3" or "2".
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ntfy_oc as oc
+
+NOTIFY = oc.NOTIFY
+STATE_DIR = oc.STATE_DIR
+QUESTION_FILE = os.path.join(STATE_DIR, "pending_question.json")
+
+# A question is forgotten after this long so a stray "1" days later is not
+# treated as an answer to something ancient.
+QUESTION_TTL_S = 45 * 60
+
+os.makedirs(STATE_DIR, exist_ok=True)
+
+def load() -> dict | None:
+    try:
+        q = json.load(open(QUESTION_FILE))
+    except Exception:
+        return None
+    if time.time() - q.get("created", 0) > QUESTION_TTL_S:
+        return None
+    return q
+
+def save(q: dict) -> None:
+    with open(QUESTION_FILE, "w") as fh:
+        json.dump(q, fh)
+
+def clear() -> None:
+    if os.path.exists(QUESTION_FILE):
+        os.remove(QUESTION_FILE)
+
+def all_sessions() -> list[dict]:
+    """Every session, working first then parked (see ntfy_oc)."""
+    return oc.all_sessions()
+
+def where_am_i() -> tuple[str, str]:
+    """
+    Decide which session this question belongs to.
+
+    Preference: the session we last spoke to, else the only running one.
+    When several are live and nothing is bound we still name one, but the
+    printed "Answer goes to:" line makes the choice visible so #N can
+    redirect it.
+
+    The binding is read through oc.bound_session(), which enforces the
+    15-minute TTL. Reading reply_target.json directly here was a third
+    implementation of that rule — and the only one that never expired, so a
+    question could be attributed to a session we had not spoken to for hours.
+    """
+    sessions = all_sessions()
+    if not sessions:
+        return "", ""
+    if len(sessions) == 1:
+        return sessions[0]["id"], sessions[0]["title"]
+    b = oc.bound_session()
+    if b:
+        for r in sessions:
+            if r["id"] == b.get("id"):
+                return r["id"], r["title"]
+    return sessions[0]["id"], sessions[0]["title"]
+
+def roster_index(sid: str) -> int:
+    """1-based position in the #N roster, or 0 if it is not listed."""
+    if not sid:
+        return 0
+    for i, r in enumerate(all_sessions(), 1):
+        if r["id"] == sid:
+            return i
+    return 0
+
+def main() -> int:
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("question", nargs="?", help="the question to ask")
+    ap.add_argument("options", nargs="?", help="options separated by |")
+    ap.add_argument("-t", "--title", default="OpenCode · quick question")
+    ap.add_argument("--no-bind", action="store_true",
+                    help="don't treat the answer as belonging to the current session")
+    ap.add_argument("--pending", action="store_true", help="show pending question")
+    ap.add_argument("--cancel", action="store_true", help="clear pending question")
+    args = ap.parse_args()
+
+    if args.pending:
+        q = load()
+        if not q:
+            print("no question waiting")
+            return 0
+        print(f"{q['question']}")
+        for i, o in enumerate(q["options"], 1):
+            print(f"  {i}. {o}")
+        return 0
+
+    if args.cancel:
+        clear()
+        print("cleared")
+        return 0
+
+    if not args.question or not args.options:
+        ap.print_help()
+        return 2
+
+    opts = [o.strip() for o in args.options.split("|") if o.strip()]
+    if not opts:
+        print("need at least one option", file=sys.stderr)
+        return 2
+    if len(opts) > 9:
+        # keep it tappable on a phone — but say so, never drop silently
+        print(f"{len(opts)} options given, using the first 9",
+              file=sys.stderr)
+        opts = opts[:9]
+
+    sid, stitle = where_am_i()
+    roster = all_sessions()
+    number = roster_index(sid)
+
+    lines = [args.question, ""]
+    for i, o in enumerate(opts, 1):
+        lines.append(f"{i}. {o}")
+    lines.append("")
+    lines.append("0  skip this question")
+    lines.append("S  type my own answer")
+    lines.append("")
+
+    # Which session is asking — so a bare "1" is never a blind reply.
+    if stitle:
+        lines.append("Asked by: " + oc.shorten(stitle) +
+                     (f"  (#{number})" if number else ""))
+    else:
+        lines.append("Asked by: a session that has since finished")
+
+    if roster:
+        lines.append("")
+        lines.append("All sessions (reply #<number>,<option>):")
+        for i, r in enumerate(roster, 1):
+            here = "  <- asking" if r["id"] == sid else ""
+            state = "working" if r["running"] else r["idle_for"]
+            lines.append(f"#{i}  {oc.pad(oc.shorten(r['title']))}  {state}{here}")
+        if any(not r["running"] for r in roster):
+            lines.append("")
+            lines.append("Replying to an idle session wakes it up.")
+
+    lines.append("")
+    lines.append("Reply:  #<session>,<option>   e.g. #2,1")
+    body = "\n".join(lines)
+
+    q = {
+        "question": args.question,
+        "options": opts,
+        "created": time.time(),
+        "session_id": sid if not args.no_bind else "",
+        "session_title": stitle,
+    }
+    # Deliver FIRST, then record. Saving and binding up front meant a failed
+    # push left a pending question nobody had seen plus a live binding, so a
+    # later stray "1" was consumed as the answer to a question Frappppy never
+    # received.
+    if not os.path.exists(NOTIFY):
+        print(f"missing {NOTIFY}", file=sys.stderr)
+        return 1
+    res = subprocess.run(
+        [NOTIFY, "-g", "ask", "-p", "urgent", body, args.title, "question"],
+        capture_output=True, text=True, timeout=120,
+    )
+    if res.returncode:
+        print((res.stderr or res.stdout).strip(), file=sys.stderr)
+        return res.returncode
+
+    save(q)
+    # We are ASKING something, so bind the reply to this session. This is the
+    # only kind of binding that exists — see oc.bind_session().
+    if sid and not args.no_bind:
+        oc.bind_session(sid, stitle)
+    print("asked")
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())

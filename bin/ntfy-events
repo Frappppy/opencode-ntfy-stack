@@ -1,0 +1,582 @@
+#!/usr/bin/env python3
+"""
+ntfy-events — instant notifications from OpenCode's SSE event stream.
+
+Why this exists alongside ntfy-heartbeat:
+  The heartbeat polls every 7 minutes. A turn that finishes and restarts
+  inside that window is never observed — the running→idle→running transition
+  is invisible to a slow poller. Worse, you could finish a reply and the
+  ping wouldn't arrive for 7 minutes.
+
+  This daemon subscrites to GET /api/event and fires the instant OpenCode
+  emits:
+      session.execution.succeeded   -> turn finished
+      session.execution.failed      -> turn errored
+      session.execution.interrupted -> turn aborted
+      permission.asked              -> a session is blocked on YOU
+
+Design notes:
+  * The stream is documented as volatile: "a slow consumer overflows and
+    fails the stream". So the reader NEVER blocks — it parses and hands off
+    to a worker queue immediately. Notification delivery happens off-thread.
+  * Reconnects forever with capped backoff; events during a gap are lost by
+    contract, so the heartbeat remains the safety net for anything missed.
+  * Outcomes are deduped so a burst of related events can't double-ping.
+
+Usage:
+  ntfy-events            run in foreground (systemd does this)
+  ntfy-events --dry      log what would be sent, don't send
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import queue
+import signal
+import sqlite3
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ntfy_activity as activity
+import ntfy_oc as oc
+
+STATE_DIR = oc.STATE_DIR
+DEDUP_FILE = os.path.join(STATE_DIR, "events_seen.json")
+# Last time we were connected. On startup we compare against this so a
+# reboot or crash doesn't silently swallow every turn that ended while
+# the daemon was down.
+WATERMARK_FILE = os.path.join(STATE_DIR, "watermark.json")
+NOTIFY = oc.NOTIFY
+EVENT_URL = "/api/event"
+
+os.makedirs(STATE_DIR, exist_ok=True)
+
+# events worth waking the human for
+TURN_END = {
+    "session.execution.succeeded": "succeeded",
+    "session.execution.failed": "failed",
+    "session.execution.interrupted": "interrupted",
+}
+
+MAX_ACTIVITY = 160
+STOP = threading.Event()
+DRY = False
+
+# A permission prompt must stay outstanding this long before it's worth a
+# phone buzz. Routine prompts are auto-answered in well under a second, so
+# this filters those out while still alerting quickly for real decisions.
+PERM_GRACE_S = 6
+# Even for genuine prompts, don't buzz the same session more than once
+# within this window — a session asking six questions in a row is one
+# "come look at this", not six.
+PERM_COOLDOWN_S = 90
+
+def log(msg: str) -> None:
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+# ── restart continuity ───────────────────────────────────────────────────────
+# The SSE stream is ephemeral: if the machine reboots (or the daemon is
+# killed) while a turn is in flight, that turn's end event is gone forever.
+# These helpers reconcile on startup so a restart never silently swallows
+# completed work.
+def load_watermark() -> int:
+    try:
+        return int(json.load(open(WATERMARK_FILE))["ts"] // 1000)
+    except Exception:
+        return 0
+
+def save_watermark(ms: int | None = None) -> None:
+    ts = ms if ms is not None else int(time.time() * 1000)
+    try:
+        json.dump({"ts": ts}, open(WATERMARK_FILE, "w"))
+    except Exception:
+        pass
+
+def catchup_missed_turns() -> None:
+    """Report turns that finished while we were not connected."""
+    since = load_watermark()
+    if not since:
+        # First ever start: nothing to reconcile against, so just seed the
+        # watermark rather than spamming a backlog of old completions.
+        save_watermark()
+        return
+
+    downtime = time.time() - since
+    log(f"resuming; was down {int(downtime // 60)}m")
+
+    try:
+        con = sqlite3.connect(f"file:{oc.DB}?mode=ro", uri=True, timeout=5)
+        rows = con.execute(
+            "select s.id, s.title, s.idle_outcome, s.time_idle "
+            "from session_v2 s where s.time_idle is not null and s.time_idle > ? "
+            # subagent turns are internal; reporting them on catch-up would
+            # replay background-agent completions as if they were real work
+            "and (s.parent_id is null or s.parent_id = '') "
+            "order by s.time_idle asc",
+            (since * 1000,),
+        ).fetchall()
+        con.close()
+    except Exception as exc:
+        log(f"catch-up query failed: {exc}")
+        save_watermark()
+        return
+
+    if not rows:
+        save_watermark()
+        return
+
+    # Only report the LATEST completion per session, and only if it looks
+    # recent enough to still be interesting (not a day-old backlog).
+    latest: dict[str, tuple] = {}
+    for sid, title, outcome, t_idle in rows:
+        latest[sid] = (title, outcome, t_idle)
+
+    now = time.time()
+    reported = 0
+    for sid, (title, outcome, t_idle) in latest.items():
+        age_min = (now - t_idle / 1000) / 60
+        if age_min > 12 * 60:      # older than 12h: almost certainly stale
+            continue
+        outcome = outcome or "finished"
+        key = f"exec:{sid}:{outcome}"
+        if seen_recently(key, window_s=24 * 3600):
+            continue
+        mark_seen(key)
+        act = last_activity(sid)
+        mark = "✅" if outcome == "succeeded" else (
+            "❌" if outcome in ("failed", "aborted") else "⏹")
+        icon = {"succeeded": "Done", "failed": "Failed"}.get(outcome, "Finished")
+        body = f"{mark} {title or sid}" + (f"\n  {act}" if act else "")
+        send(body, f"OpenCode · {icon} (while away)",
+             "white_check_mark" if outcome == "succeeded" else "x")
+        reported += 1
+
+    if reported:
+        log(f"catch-up: reported {reported} turn(s) that finished while away")
+    else:
+        log("catch-up: nothing to report")
+    save_watermark()
+
+# ── service discovery ───────────────────────────────────────────────────────
+# Aliases, not wrappers: a local `def x(): return oc.x()` is indirection that
+# suggests a second implementation exists. ntfy_oc is the only one.
+service_info = oc.service_info
+
+# ── dedup ───────────────────────────────────────────────────────────────────
+def load_seen() -> dict:
+    try:
+        return json.load(open(DEDUP_FILE))
+    except Exception:
+        return {}
+
+def seen_recently(key: str, window_s: int = 120) -> bool:
+    seen = load_seen()
+    last = seen.get(key)
+    return bool(last and (time.time() - last) < window_s)
+
+def mark_seen(key: str) -> None:
+    seen = load_seen()
+    # prune: keep only the last hour so the file can't grow unbounded
+    cutoff = time.time() - 3600
+    seen = {k: v for k, v in seen.items() if v > cutoff}
+    seen[key] = time.time()
+    try:
+        json.dump(seen, open(DEDUP_FILE, "w"))
+    except Exception:
+        pass
+
+# ── context for a "what just finished" message ──────────────────────────────
+session_title = oc.session_title
+
+def last_activity(session_id: str) -> str:
+    """
+    What the session just finished doing, in plain English.
+
+    Deliberately does NOT include commands, file paths, or tool arguments —
+    those are implementation noise on a phone screen.
+    """
+    try:
+        con = sqlite3.connect(f"file:{oc.DB}?mode=ro", uri=True, timeout=5)
+        rows = con.execute(
+            "select data from session_message where session_id=? "
+            "order by time_updated desc limit 6",
+            (session_id,),
+        ).fetchall()
+        con.close()
+    except Exception:
+        return ""
+
+    for (data,) in rows:
+        try:
+            items = json.loads(data).get("content") or []
+        except Exception:
+            continue
+        said = activity.plain_conclusion(items)
+        if said:
+            return said
+        for it in reversed(items):
+            if it.get("type") == "tool":
+                return activity.describe_tool(it.get("name"), it.get("state") or {})
+    return ""
+
+def clip(s: str, n: int = MAX_ACTIVITY) -> str:
+    s = " ".join(s.split())
+    return s if len(s) <= n else s[: n - 1].rstrip() + "…"
+
+# ── notify (off the read thread) ────────────────────────────────────────────
+def send(body: str, title: str, tag: str, prio: str | None = None) -> None:
+    if DRY:
+        log(f"DRY would send [{title}]: {body}")
+        return
+    if not os.path.exists(NOTIFY):
+        log(f"missing {NOTIFY}")
+        return
+    cmd = [NOTIFY, "-g", "events"]
+    if prio:
+        cmd += ["-p", prio]
+    cmd += [body, title, tag]
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    if res.returncode:
+        log(f"send failed: {(res.stderr or res.stdout).strip()}")
+    else:
+        log(f"sent: {title}")
+
+def handle_turn_end(session_id: str, outcome: str, detail: str) -> None:
+    # Subagent completions are internal bookkeeping, not work the human is
+    # waiting on — see oc.is_subagent(). The comment in dispatch() claimed
+    # this filter existed; it did not, so background agents were pinging.
+    if oc.is_subagent(session_id):
+        log(f"turn end on subagent {session_id}, not notifying")
+        return
+    key = f"exec:{session_id}:{outcome}"
+    if seen_recently(key):
+        return
+    mark_seen(key)
+
+    title = oc.shorten(session_title(session_id))
+    act = last_activity(session_id)
+
+    if outcome == "succeeded":
+        mark, icon, prio = "✅", "Done", None
+        tag = "white_check_mark"
+    elif outcome == "failed":
+        mark, icon, prio = "❌", "Failed", "high"
+        tag = "x"
+    else:
+        mark, icon, prio = "⏹", "Interrupted", "default"
+        tag = "no_entry"
+
+    # One line, plain English. The notification title carries the status so
+    # the body can stay short.
+    lines = [f"{mark} {title}"]
+    if act:
+        lines.append(f"  {act}")
+    elif detail:
+        lines.append(f"  {detail}")
+
+    send("\n".join(lines), f"OpenCode · {icon}", tag, prio)
+
+def permission_still_pending(request_id: str, directory: str | None = None) -> bool:
+    """
+    Ask the server whether this prompt is ACTUALLY still waiting on a human.
+
+    Sessions auto-approve routine permissions, producing a rapid asked→replied
+    stream. Those must never reach the phone — only prompts that are still
+    outstanding after a grace period are worth waking someone for.
+
+    NOTE the endpoint is /api/permission/request (slash-separated), NOT
+    /api/permission.request.list. The dotted form 404s, and this function
+    used to treat that 404 as "still pending" — which fired a ping for every
+    single prompt (37 in one window). A failed lookup now returns False so a
+    bad URL can never cause a flood again.
+    """
+    base_pw = service_info()
+    if not base_pw:
+        return False
+    base, pw = base_pw
+    try:
+        token = base64.b64encode(f"opencode:{pw}".encode()).decode()
+        url = f"{base}/api/permission/request"
+        if directory:
+            url += "?" + urllib.parse.urlencode({"location[directory]": directory})
+        req = urllib.request.Request(
+            url, headers={"Authorization": f"Basic {token}"},
+        )
+        with urllib.request.urlopen(req, timeout=6) as r:
+            if r.status != 200:
+                log(f"perm lookup HTTP {r.status} — treating as not pending")
+                return False
+            data = json.loads(r.read().decode()).get("data") or []
+    except urllib.error.HTTPError as e:
+        log(f"perm lookup failed HTTP {e.code} — treating as not pending")
+        return False
+    except Exception as exc:
+        # Unreachable server / DNS / timeout: stay quiet rather than risk
+        # re-introducing the flood. A real prompt still gets reported by the
+        # 7-minute heartbeat's needs_you path.
+        log(f"perm lookup error ({exc}) — treating as not pending")
+        return False
+    return any(p.get("id") == request_id for p in data)
+
+def handle_permission(event: dict) -> None:
+    data = event.get("data") or {}
+    sid = data.get("sessionID", "")
+    rid = data.get("id") or data.get("requestID") or ""
+    if not rid:
+        return
+    directory = (event.get("location") or {}).get("directory")
+
+    # Per-session cooldown: even genuine prompts shouldn't flood the phone.
+    cooldown_key = f"permcd:{sid}"
+    if seen_recently(cooldown_key, window_s=PERM_COOLDOWN_S):
+        return
+
+    key = f"perm:{sid}:{rid}"
+    if seen_recently(key):
+        return
+    mark_seen(key)
+
+    # Wait out the auto-answer window before deciding this is real.
+    # Run off the worker thread: a 6s sleep here would stall turn-end
+    # notifications for other sessions.
+    def evaluate():
+        # Event.wait() returns True only if the event got SET (shutdown).
+        # It returns False on timeout — which is the normal case here, and
+        # must NOT abort. The previous `if not STOP.wait(...)` inverted this
+        # and silently returned on every timeout, so no permission prompt
+        # was ever evaluated.
+        if STOP.wait(PERM_GRACE_S):
+            return  # shutting down mid-grace
+        try:
+            if not permission_still_pending(rid, directory):
+                log(f"perm {rid} auto-answered during grace, not notifying")
+                return
+            mark_seen(cooldown_key)
+            title = oc.shorten(session_title(sid)) if sid else "a session"
+            what = (
+                data.get("title") or data.get("type") or data.get("message")
+                or data.get("text") or "permission requested"
+            )
+            body = f"🙋 I need you:\n  🔐 {title}: {clip(str(what), 120)}"
+            # We are ASKING something, so bind the reply to this session.
+            if sid:
+                oc.bind_session(sid, title)
+            send(body, "OpenCode · needs your input", "hand", "urgent")
+        except Exception as exc:
+            log(f"perm evaluate error: {exc}")
+
+    threading.Thread(target=evaluate, daemon=True).start()
+
+# ── worker queue (keeps the SSE reader non-blocking) ────────────────────────
+Q: queue.Queue = queue.Queue(maxsize=1000)
+
+def worker() -> None:
+    while not STOP.is_set():
+        try:
+            item = Q.get(timeout=0.5)
+        except queue.Empty:
+            continue
+        try:
+            kind = item.get("kind")
+            if kind == "turn_end":
+                handle_turn_end(item["sessionID"], item["outcome"], item.get("detail", ""))
+            elif kind == "permission":
+                handle_permission(item["event"])
+            elif kind == "checkpoint":
+                handle_checkpoint(item["sessionID"])
+        except Exception as exc:
+            log(f"handler error: {exc}")
+
+
+def handle_checkpoint(session_id: str) -> None:
+    """
+    A session is about to compact its context away.
+
+    Compaction is the one moment the human is guaranteed to lose detail, so
+    send a short "where we are" snapshot: what it asked for, what it last
+    said, and the files it has been working in.
+    """
+    # A subagent compacting is not a moment the human needs to capture —
+    # checked before any state is written, so background agents cannot burn
+    # a dedup slot.
+    if oc.is_subagent(session_id):
+        return
+
+    key = f"compact:{session_id}"
+    if seen_recently(key, window_s=600):
+        return
+    mark_seen(key)
+
+    title = oc.shorten(session_title(session_id))
+    try:
+        con = oc.db()
+        row = con.execute(
+            "select data from session_message where session_id=? "
+            "order by time_updated desc limit 40",
+            (session_id,),
+        ).fetchall()
+        con.close()
+    except Exception as exc:
+        log(f"checkpoint read failed: {exc}")
+        return
+
+    said, touched = "", []
+    for (data,) in row:
+        try:
+            items = json.loads(data).get("content") or []
+        except Exception:
+            continue
+        for it in items:
+            if it.get("type") == "tool":
+                st = it.get("state") or {}
+                inp = st.get("input")
+                if isinstance(inp, dict):
+                    p = inp.get("path") or inp.get("file")
+                    if isinstance(p, str) and p and p not in touched:
+                        touched.append(p)
+            elif it.get("type") == "text" and not said and (it.get("text") or "").strip():
+                said = activity.plain_conclusion([it], limit=140)
+
+    lines = [f"🧠 {title}", "  Context is being trimmed — here's where we are:"]
+    if said:
+        lines.append(f"  {said}")
+    if touched:
+        shown = ", ".join(touched[:3])
+        more = f" (+{len(touched) - 3})" if len(touched) > 3 else ""
+        lines.append(f"  files: {shown}{more}")
+    lines.append("  Reply to pick this thread back up.")
+
+    send("\n".join(lines), "OpenCode · checkpoint", "brain", "high")
+    log(f"checkpoint sent for {title}")
+
+# ── SSE reader ──────────────────────────────────────────────────────────────
+def stream() -> None:
+    svc = service_info()
+    if not svc:
+        # NOTE: unpacking the None this used to do raised TypeError before the
+        # `if not base` check below could ever run, so the daemon reported
+        # "cannot unpack non-iterable NoneType" instead of the real reason.
+        raise RuntimeError("opencode service not running")
+    base, pw = svc
+
+    token = base64.b64encode(f"opencode:{pw}".encode()).decode()
+    req = urllib.request.Request(
+        f"{base}{EVENT_URL}",
+        headers={"Authorization": f"Basic {token}", "Accept": "text/event-stream"},
+    )
+    # long timeout: the server sends `: heartbeat` comments periodically
+    resp = urllib.request.urlopen(req, timeout=300)
+    log(f"connected to {base}{EVENT_URL}")
+
+    while not STOP.is_set():
+        line = resp.readline()
+        if not line:
+            log("stream closed by server")
+            break
+        if isinstance(line, bytes):
+            line = line.decode("utf8", "replace")
+        line = line.rstrip("\n").rstrip("\r")
+
+        if not line.startswith("data:"):
+            # blank lines separate events; `: ...` is an SSE comment
+            continue
+
+        payload = line[5:].strip()
+        if not payload:
+            continue
+        try:
+            ev = json.loads(payload)
+        except Exception:
+            continue
+        dispatch(ev)
+
+def dispatch(ev: dict) -> None:
+    etype = ev.get("type") or ""
+    data = ev.get("data") or {}
+
+    if etype in TURN_END:
+        if not data.get("sessionID"):
+            return
+        # only tell the human about a turn on a REAL session, not subagents
+        detail = ""
+        err = data.get("error")
+        if isinstance(err, dict):
+            detail = clip(str(err.get("message") or err), 160)
+        elif data.get("reason"):
+            detail = f"reason: {data['reason']}"
+        try:
+            Q.put_nowait({
+                "kind": "turn_end",
+                "sessionID": data["sessionID"],
+                "outcome": TURN_END[etype],
+                "detail": detail,
+            })
+        except queue.Full:
+            log("queue full, dropping event")
+
+    elif etype == "permission.asked":
+        try:
+            Q.put_nowait({"kind": "permission", "event": ev})
+        except queue.Full:
+            pass
+
+    elif etype in ("session.compaction.ended", "session.compaction.completed"):
+        # Context is about to be trimmed. This is the last cheap moment to
+        # tell the human where things stand, because the detail it is about
+        # to drop is exactly what a checkpoint should capture.
+        sid = data.get("sessionID")
+        if sid:
+            try:
+                Q.put_nowait({"kind": "checkpoint", "sessionID": sid})
+            except queue.Full:
+                pass
+
+# ── main loop with reconnect ────────────────────────────────────────────────
+def main() -> int:
+    global DRY
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("--dry", action="store_true", help="log instead of send")
+    args = ap.parse_args()
+    DRY = args.dry
+
+    threading.Thread(target=worker, daemon=True).start()
+
+    # First connect: reconcile anything that finished while we were down.
+    try:
+        catchup_missed_turns()
+    except Exception as exc:
+        log(f"catch-up error: {exc}")
+
+    backoff = 1
+    while not STOP.is_set():
+        try:
+            stream()
+            backoff = 1
+        except Exception as exc:
+            if STOP.is_set():
+                break
+            log(f"stream error: {exc} (reconnect in {backoff}s)")
+            STOP.wait(backoff)
+            backoff = min(backoff * 2, 60)
+    log("stopped")
+    return 0
+
+def _shutdown(signum, frame):
+    # Stamp the shutdown moment so the next start knows exactly how long
+    # we were away and can report anything that finished in that window.
+    save_watermark()
+    STOP.set()
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
+    sys.exit(main())
