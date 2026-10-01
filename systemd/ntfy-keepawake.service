@@ -7,7 +7,11 @@ Documentation=man:systemd-inhibit(1)
 # the process. A oneshot + "sleep infinity" in ExecStartPost would block
 # `systemctl start` forever, because oneshot waits for ExecStartPost.
 Type=simple
-ExecStart=/usr/bin/systemd-inhibit --what=idle:sleep:shutdown \
+# Deliberately NOT "shutdown": a block-mode shutdown inhibitor makes
+# logind refuse an explicit poweroff, so the machine can never be shut
+# down normally while this holds. Blocking idle:sleep still stops the
+# box suspending out from under remote control, which is the point.
+ExecStart=/usr/bin/systemd-inhibit --what=idle:sleep \
     --who="OpenCode remote control" \
     --why="so phone pings, replies and approvals keep working" \
     --mode=block \
