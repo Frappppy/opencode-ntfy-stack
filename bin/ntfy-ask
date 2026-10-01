@@ -143,6 +143,24 @@ def main() -> int:
     roster = all_sessions()
     number = roster_index(sid)
 
+    # Same-question guard: a session that is still waiting re-asks on later
+    # turns, and each re-ask is minutes apart so ntfy-notify's 30s dedup never
+    # catches it — the phone buzzes with the identical question once per turn
+    # for as long as Frappppy is late. If this exact question is already
+    # pending and fresh, refresh its TTL instead of delivering a copy.
+    # The asker must match too: a different session asking the same words is
+    # a different request, because the answer would route elsewhere.
+    old = load()
+    if (old and old.get("question") == args.question
+            and old.get("options") == opts
+            and old.get("session_id") == (sid if not args.no_bind else "")):
+        old["created"] = time.time()
+        save(old)
+        if sid and not args.no_bind:
+            oc.bind_session(sid, stitle)
+        print("already pending — TTL refreshed, not re-sent")
+        return 0
+
     lines = [args.question, ""]
     for i, o in enumerate(opts, 1):
         lines.append(f"{i}. {o}")

@@ -366,6 +366,56 @@ def test_health_help_exits_zero():
     assert callable(health.main)
 
 
+# ── ask: same-question guard ──────────────────────────────────────────────
+def _run_ask(mod, argv):
+    old_argv = sys.argv
+    sys.argv = argv
+    try:
+        return mod.main()
+    finally:
+        sys.argv = old_argv
+
+
+def _seed_question(mod, session_id=""):
+    mod.save({"question": "Guard?", "options": ["Yes", "No"],
+              "created": time.time(), "session_id": session_id,
+              "session_title": ""})
+
+
+def test_ask_same_question_not_resent():
+    # A session that is still waiting re-asks on later turns; each re-ask is
+    # minutes apart so the sender's 30s dedup never catches it. The guard
+    # refreshes the TTL instead of delivering a copy.
+    ask = load_script("ntfy_ask_mod", "ntfy-ask")
+    ask.all_sessions = lambda: []          # where_am_i -> ("", "")
+    _seed_question(ask)
+    rc = _run_ask(ask, ["ntfy-ask", "Guard?", "Yes|No"])
+    assert rc == 0, f"guard must exit 0, got {rc}"
+    q = ask.load()
+    assert q is not None, "guard must keep (not consume) the question"
+    assert time.time() - q["created"] < 60, "guard must refresh the TTL"
+
+
+def test_ask_different_options_sends():
+    ask = load_script("ntfy_ask_mod", "ntfy-ask")
+    ask.all_sessions = lambda: []
+    _seed_question(ask)
+    rc = _run_ask(ask, ["ntfy-ask", "Guard?", "Yes|Maybe"])
+    # NOTIFY does not exist under the sandbox HOME, so a send attempt fails
+    # loudly — which is exactly what proves the guard did NOT swallow it.
+    assert rc == 1, f"a changed question must go to the send path, got {rc}"
+
+
+def test_ask_same_words_different_session_sends():
+    # Same words, different asker = different request: the answer would route
+    # elsewhere, so it must still send.
+    ask = load_script("ntfy_ask_mod", "ntfy-ask")
+    ask.all_sessions = lambda: []
+    _seed_question(ask, session_id="ses_someone_else")
+    rc = _run_ask(ask, ["ntfy-ask", "Guard?", "Yes|No"])
+    assert rc == 1, f"a different asker must still send, got {rc}"
+
+
 # ── runner ────────────────────────────────────────────────────────────────
 def main():
     want = sys.argv[1:] if len(sys.argv) > 1 else None

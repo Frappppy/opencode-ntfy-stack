@@ -277,7 +277,7 @@ and re-subscribe the phone.
 
 ```bash
 python3 tests/test_notify.py     # 27 tests — the sender, end to end
-python3 tests/test_lib.py        # 33 tests — the library and reply routing
+python3 tests/test_lib.py        # 36 tests — the library, reply routing, ask guard
 python3 tests/test_install.py    # 11 tests — install/update/uninstall
 python3 tests/argcheck.py        # 35 assertions — flag/doc/portability drift
 ```
