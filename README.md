@@ -122,6 +122,62 @@ over — it is rebuilt as the stack runs.
 
 ---
 
+## Using it from your phone
+
+Notifications are **plain English only** — never a command, a file path, or a
+tool argument. You should be able to read them at a glance:
+
+```
+✅ Audit 6 smaller ntfy scripts (while you were away)
+🔴 Session stuck: same command repeated 4 times
+❓ Need input — Submit capture_13.png to the bounty?
+```
+
+The heartbeat lists **every** session, working first, then idle ones with how
+long they've been idle — so you can pick a thread to answer:
+
+```
+WORKING NOW
+#1  Phone notificatio…
+
+IDLE
+#2  eToro MBB bounty    12m ago
+#3  Audit 6 smaller      3h ago
+```
+
+### Replying
+
+Reply to any notification. Prefix with `#N` to choose the session — sessions
+are numbered running-first, then alphabetically, so `#N` always means the same
+thing:
+
+| You send | Meaning |
+|---|---|
+| `#2 do the thing` | send text to session 2 |
+| `1` / `1,3` | answer options in the question's session |
+| `#2, 1` | session 2 **and** option 1 — both at once |
+| `0` | skip the question |
+| `S` | "let me type my own" — your next message is the answer |
+| `?` | show the routing map (active + parked sessions) |
+| `yes` / `no` | answer a pending permission |
+
+With one session running, a bare reply goes there. With several running and no
+recent question, the bridge **asks which one** rather than guessing — a
+mistyped number is surfaced, never silently misrouted.
+
+### Asking the human
+
+```bash
+ntfy-ask "Which should I chase first?" "Deeplinks|Auth tokens|TLS pinning"
+ntfy-ask --pending      # what's still waiting
+ntfy-ask --cancel       # forget it
+```
+
+Questions carry the session roster and the origin session, expire after
+45 minutes, and can be answered from a parked session — which wakes it up.
+
+---
+
 ## Configuration
 
 Everything lives in **`~/.config/ntfy-notify.conf`**:
@@ -222,6 +278,7 @@ and re-subscribe the phone.
 ```bash
 python3 tests/test_notify.py     # 27 tests — the sender, end to end
 python3 tests/test_lib.py        # 33 tests — the library and reply routing
+python3 tests/test_install.py    # 11 tests — install/update/uninstall
 python3 tests/argcheck.py        # 35 assertions — flag/doc/portability drift
 ```
 
@@ -232,6 +289,14 @@ touches your state, and **never reaches your phone**.
 The listener can be told to answer `500`, `429`, or to recover mid-test —
 which is how the retry, refusal-marker and circuit-breaker rules are proven
 rather than asserted.
+
+> **One trap the install tests exist for:** `systemctl --user` resolves the
+> user by D-Bus, **not** by `$HOME`. A throwaway `$HOME` redirects every file
+> path but leaves systemd pointed at your live session — so an uninstall run
+> inside a sandbox happily disabled the real units. `install.sh` now refuses to
+> touch systemd unless it is operating on your actual unit directory, and
+> `test_sandbox_uninstall_leaves_live_systemd_alone` fails loudly if that guard
+> ever disappears.
 
 ---
 
@@ -287,6 +352,7 @@ opencode-ntfy-stack/
 ├── config/
 │   └── ntfy-notify.conf.example   # copied by install.sh (never committed filled in)
 ├── tests/                  # sandboxed regression suite + static checks
+│                           # (test_install guards the systemd/$HOME trap)
 ├── install.sh              # install / update / --uninstall / --purge
 └── README.md
 ```

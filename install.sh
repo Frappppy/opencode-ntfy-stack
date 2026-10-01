@@ -18,6 +18,20 @@ CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}"
 CONF="$CONF_DIR/ntfy-notify.conf"
 EXAMPLE="$REPO/config/ntfy-notify.conf.example"
 
+# systemd --user resolves the user by D-Bus, NOT by $HOME. Sourcing a
+# throwaway $HOME redirects every FILE path but leaves systemd pointed at the
+# live session — so `./install.sh --uninstall` inside a test sandbox happily
+# disabled the real ntfy-events/reply/keepawake and all three timers. (It
+# did exactly that on 2026-10-01; the stack had to be re-enabled by hand.)
+#
+# Only talk to systemd when we are operating on this user's REAL unit dir.
+REAL_HOME="$(getent passwd "$(id -u)" | cut -d: -f6)"
+LIVE=1
+case "$UNIT_DIR" in
+  "$REAL_HOME"/*) : ;;
+  *) LIVE=0 ;;
+esac
+
 UNITS=(
   ntfy-events.service
   ntfy-reply.service
@@ -70,9 +84,13 @@ if [[ "$MODE" == "uninstall" ]]; then
   # meant to run on their own); then delete EVERY ntfy-* file. Enumerating
   # what to delete from the enable list left the three timer-driven
   # .service companions behind on disk.
-  for u in "${UNITS[@]}"; do
-    systemctl --user disable --now "$u" >/dev/null 2>&1 || true
-  done
+  if [[ "$LIVE" == "1" ]]; then
+    for u in "${UNITS[@]}"; do
+      systemctl --user disable --now "$u" >/dev/null 2>&1 || true
+    done
+  else
+    info "sandbox install ($UNIT_DIR) — leaving systemd alone"
+  fi
   removed=0
   for f in "$UNIT_DIR"/ntfy-*; do
     [[ -f "$f" ]] || continue
@@ -149,7 +167,7 @@ else
 fi
 
 # ── enable ────────────────────────────────────────────────────────────────
-if [[ "$DO_ENABLE" == "1" ]]; then
+if [[ "$DO_ENABLE" == "1" && "$LIVE" == "1" ]]; then
   echo "Enabling units"
   systemctl --user daemon-reload
   for u in "${UNITS[@]}"; do
@@ -159,6 +177,8 @@ if [[ "$DO_ENABLE" == "1" ]]; then
       printf '  \033[33m!\033[0m could not enable %s (systemd unavailable?)\n' "$u"
     fi
   done
+elif [[ "$DO_ENABLE" == "1" ]]; then
+  info "sandbox install ($UNIT_DIR) — files copied, systemd left untouched"
 fi
 
 # ── summary ───────────────────────────────────────────────────────────────
