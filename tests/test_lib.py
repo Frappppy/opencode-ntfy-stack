@@ -416,6 +416,39 @@ def test_ask_same_words_different_session_sends():
     assert rc == 1, f"a different asker must still send, got {rc}"
 
 
+# ── events: only failures and interrupts buzz ──────────────────────────────
+def test_events_succeeded_turn_sends_nothing():
+    # Per-turn "Done" was 145 of 244 pings over five days, and it was always
+    # wrong-footed: sessions chain straight into the next turn (Viator said
+    # "Done" at 13:13:11 on Oct 2 and worked again by 13:15:51), so the phone
+    # showed "Done ✅ X" and then "1 working: X". ntfy-heartbeat's
+    # running→gone detector owns finish announcements now — it is the only
+    # signal that separates a real finish from a mid-work pause.
+    ev = load_script("ntfy_events_mod", "ntfy-events")
+    sent = []
+    ev.send = lambda *a, **k: sent.append(a)
+    ev.handle_turn_end("ses_test", "succeeded", "some detail")
+    assert sent == [], f"succeeded turns must stay silent, got {sent!r}"
+
+
+def test_events_failure_and_interrupt_still_notify():
+    # Failures and interrupts are immediate news regardless of the flood fix —
+    # a task dying is exactly when the phone should buzz.
+    ev = load_script("ntfy_events_mod", "ntfy-events")
+    sent = []
+    ev.send = lambda *a, **k: sent.append(a)
+    # The sandbox has no OpenCode store; stub the lookups the handler does
+    # after the subagent check (module-level aliases, so oc stays untouched).
+    ev.session_title = lambda sid: "Test Session"
+    ev.last_activity = lambda sid: "ran a command"
+    ev.handle_turn_end("ses_test", "failed", "boom")
+    ev.handle_turn_end("ses_test", "interrupted", "user stopped it")
+    assert len(sent) == 2, f"want 2 notifications, got {len(sent)}"
+    titles = [c[1] for c in sent]
+    assert any("Failed" in t for t in titles), titles
+    assert any("Interrupted" in t for t in titles), titles
+
+
 # ── runner ────────────────────────────────────────────────────────────────
 def main():
     want = sys.argv[1:] if len(sys.argv) > 1 else None

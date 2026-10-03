@@ -263,6 +263,31 @@ case "$priority" in
   high|urgent) critical=true ;;
 esac
 
+# ── daily budget ───────────────────────────────────────────────────────────
+# ntfy.sh allows 250 published messages per IP per day. Sep 30 blew through
+# it by noon (240 delivered, then 97 refusals): once the wall was hit,
+# EVERYTHING was refused — permissions, questions, failures — until
+# midnight. Routine chatter must therefore yield before the wall: past the
+# cap, default/low/min messages are refused HERE, locally, without spending
+# a network attempt, and exit 3 — never 0, because callers read 0 as
+# "delivered" and a skip is not a delivery (heartbeat then queues the
+# message in pending.txt and re-renders it next tick; nothing is lost).
+# high/urgent always attempt: if the real quota is gone, ntfy itself
+# refuses with 429 and the publish_blocked marker takes over from there.
+# The count is successes only — failed attempts cost no quota.
+ROUTINE_BUDGET=200
+if ! $critical; then
+  used_today=$(awk -F'\t' -v d="$(date +%F)" \
+    '$1 ~ "^"d && $3 == "success" {n++} END {print n+0}' \
+    "$METRICS_FILE" 2>/dev/null)
+  used_today=${used_today:-0}
+  if (( used_today >= ROUTINE_BUDGET )); then
+    log_metric "budget_skip" 0 "-" 0
+    echo "Routine budget reached ($used_today/$ROUTINE_BUDGET today) — skipped, exit 3" >&2
+    exit 3
+  fi
+fi
+
 # Important messages get more persistence, not less.
 #
 # Routine messages get FEWER attempts on purpose. This route drops packets,

@@ -217,10 +217,10 @@ These are not preferences. Each one is written in code because the opposite
 behaviour caused a real, silent failure.
 
 **Honest exit codes** — `ntfy-notify` exits `0` delivered, `1` not delivered,
-`2` bad usage or missing config. It never exits `0` on a message that didn't
-go out. A circuit that was "open" used to skip the send and exit `0`; the
-heartbeat read that as delivered and cleared its queue — 15 notifications
-vanished that way.
+`2` bad usage or missing config, `3` skipped by the daily routine budget. It
+never exits `0` on a message that didn't go out. A circuit that was "open" used
+to skip the send and exit `0`; the heartbeat read that as delivered and cleared
+its queue — 15 notifications vanished that way.
 
 **Never skip, only degrade.** An open circuit or a fresh quota refusal drops
 the sender to *one* attempt — it does not skip the attempt. One try still
@@ -232,6 +232,14 @@ channel that can deliver nothing as "reachable". On a `429` the sender stores
 the timestamp and ntfy's own reason text, and the health watchdog reads that
 marker.
 
+**Daily budget.** ntfy.sh allows 250 publishes per IP per day; the first
+heavy day hit the wall at noon and *everything* — permissions, questions,
+failures — was refused until midnight. Past 200 delivered messages, routine
+(default/low) sends are refused **locally** with exit `3`, before spending a
+network attempt, leaving the last 50 slots for high/urgent traffic. Callers
+treat `3` like any failure: the heartbeat queues the message and re-renders
+it next tick, so nothing is lost — it goes out once the counter rolls over.
+
 **Send budget.** Every caller runs the sender under `timeout=120`, so the
 sender bounds its *whole* retry sequence — 90s critical, 30s routine. A retry
 loop that outlives its caller is worse than no retry loop.
@@ -239,6 +247,13 @@ loop that outlives its caller is worse than no retry loop.
 **Dedup records on delivery, never on attempt.** Writing the hash before
 sending meant a message that failed every attempt was marked sent, and the
 retry that mattered was swallowed as a duplicate.
+
+**A finished session pings once; a finished turn doesn't.** `ntfy-events`
+buzzes immediately for failed/interrupted turns and permission prompts (~8s),
+but a *successful* turn stays silent — buzzing each one was 145 of 244 pings
+over five days, and it always wrong-footed: sessions chain straight into the
+next turn, so "Done ✅ X" arrived while X kept working. The heartbeat's
+running→gone detector announces the session finish exactly once instead.
 
 **Subagents don't ping you.** Background agents fire the same events as real
 sessions; `is_subagent()` filters them — and *fails open*, because dropping a
@@ -276,8 +291,8 @@ and re-subscribe the phone.
 ## Testing
 
 ```bash
-python3 tests/test_notify.py     # 27 tests — the sender, end to end
-python3 tests/test_lib.py        # 36 tests — the library, reply routing, ask guard
+python3 tests/test_notify.py     # 30 tests — the sender, end to end
+python3 tests/test_lib.py        # 38 tests — the library, reply routing, ask/events guards
 python3 tests/test_install.py    # 11 tests — install/update/uninstall
 python3 tests/argcheck.py        # 35 assertions — flag/doc/portability drift
 ```

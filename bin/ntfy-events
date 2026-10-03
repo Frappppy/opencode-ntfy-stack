@@ -257,6 +257,20 @@ def handle_turn_end(session_id: str, outcome: str, detail: str) -> None:
     if oc.is_subagent(session_id):
         log(f"turn end on subagent {session_id}, not notifying")
         return
+
+    # A SUCCEEDED turn is not news on its own. Buzzing one per turn (2-minute
+    # dedup) produced 145 of 244 pings over five days, and the word "Done"
+    # was wrong: sessions chain straight into the next turn (Viator said
+    # "Done" at 13:13:11 on Oct 2 and was working again by 13:15:51), so the
+    # phone showed "Done ✅ X" and minutes later "1 working: X".
+    # Session-level finishes are announced ONCE by ntfy-heartbeat's
+    # running→gone detector — the only signal that separates a real finish
+    # from a mid-work pause. Failures and interrupts still buzz immediately,
+    # and catch-up still reports completions made while this daemon was down.
+    if outcome == "succeeded":
+        log(f"succeeded turn on {session_id} — finish is the heartbeat's to announce")
+        return
+
     key = f"exec:{session_id}:{outcome}"
     if seen_recently(key):
         return

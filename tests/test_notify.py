@@ -520,6 +520,58 @@ def test_template_title_override():
         lst.close()
 
 
+# ── daily budget ───────────────────────────────────────────────────────────
+def _seed_budget(env, n_success):
+    """Record `n_success` delivered messages for TODAY in the metrics file."""
+    today = time.strftime("%Y-%m-%d")
+    with open(state(env, "metrics.log"), "w") as fh:
+        for _ in range(n_success):
+            fh.write(f"{today}T10:00:00-04:00\t{TOPIC}\tsuccess\t1\t200\t5\n")
+
+
+def test_routine_message_gated_at_budget():
+    # Past the cap the message must be refused LOCALLY: no request reaches
+    # the listener, and the exit code must be 3 — never 0, because callers
+    # read 0 as "delivered" and a skip is not a delivery.
+    lst = Listener()
+    try:
+        _, env = sandbox(lst.url)
+        _seed_budget(env, 200)
+        res, reqs = requests_to(lst, env, "gated", "budget")
+        assert res.returncode == 3, f"want exit 3, got {res.returncode}"
+        assert reqs == [], "a gated message must not reach the network"
+        assert "budget" in res.stderr.lower(), res.stderr
+        assert "budget_skip" in read(state(env, "metrics.log"))
+    finally:
+        lst.close()
+
+
+def test_high_priority_bypasses_budget():
+    # Urgent traffic must still attempt past the routine cap — the only
+    # wall that matters for it is ntfy's own 429, handled separately.
+    lst = Listener()
+    try:
+        _, env = sandbox(lst.url)
+        _seed_budget(env, 200)
+        res, reqs = requests_to(lst, env, "-p", "high", "urgent", "budget")
+        assert res.returncode == 0, f"high must send, got {res.returncode}"
+        assert len(reqs) == 1, f"want 1 request, got {len(reqs)}"
+    finally:
+        lst.close()
+
+
+def test_routine_message_sends_below_budget():
+    lst = Listener()
+    try:
+        _, env = sandbox(lst.url)
+        _seed_budget(env, 199)
+        res, reqs = requests_to(lst, env, "fits", "budget")
+        assert res.returncode == 0, f"want delivery, got {res.returncode}"
+        assert len(reqs) == 1, f"want 1 request, got {len(reqs)}"
+    finally:
+        lst.close()
+
+
 # ── runner ────────────────────────────────────────────────────────────────
 def main():
     want = sys.argv[1:] if len(sys.argv) > 1 else None
