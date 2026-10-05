@@ -52,6 +52,10 @@ NTFY_SERVER = oc.NTFY_SERVER
 NOTIFY = oc.NOTIFY
 STATE_DIR = oc.STATE_DIR
 CURSOR_FILE = os.path.join(STATE_DIR, "reply_cursor.json")
+# ntfy-notify's record of ids it has published. Used to recognise our own
+# notifications on the base topic regardless of their title.
+SENT_IDS_FILE = oc.SENT_IDS_FILE
+SENT_IDS_TTL_S = 48 * 3600
 # Written by ntfy-ask; a reply of pure numbers answers it.
 QUESTION_FILE = os.path.join(STATE_DIR, "pending_question.json")
 # Marker proving the cursor has been initialised at least once, so restarts
@@ -70,20 +74,58 @@ DRY = False
 # Guard against a runaway loop: max replies processed per wake.
 MAX_BATCH = 20
 
+def our_sent_ids() -> set[str]:
+    """
+    Ids of messages WE published, from ntfy-notify's sent-id record.
+
+    This is how a notification that used a custom title ("Candid submitted",
+    "Hypixel bounty") is still recognised as ours: ntfy assigns every publish
+    an id, ntfy-notify records it, and we match on it. The alternative — a
+    title-prefix guess — let those notices back in as if the human had typed
+    them, so a session got steered by its own status message.
+    """
+    ids: set[str] = set()
+    cutoff = time.time() - SENT_IDS_TTL_S
+    try:
+        with open(SENT_IDS_FILE) as fh:
+            for line in fh:
+                parts = line.rstrip("\n").split("\t")
+                if not parts or not parts[0]:
+                    continue
+                try:
+                    ts = float(parts[1]) if len(parts) > 1 else 0.0
+                except ValueError:
+                    ts = 0.0
+                if ts >= cutoff:
+                    ids.add(parts[0])
+    except OSError:
+        pass
+    return ids
+
+
 def is_our_own(m: dict) -> bool:
     """
     True if this message is one of our notifications, not a human reply.
 
-    Decided on the TITLE alone. Every notification we send goes through
-    ntfy-notify, which always sets a Title, and all of ours start with
-    "OpenCode" - so that is a complete and reliable signal.
+    Two signals, strongest first:
+
+    1. The id ntfy assigned. Every notification we send goes through
+       ntfy-notify, which records that id, so this is exact — it cannot
+       confuse our own message for a human one, or the reverse.
+    2. The title prefix "OpenCode". All our own notices use it, but an agent
+       calling ntfy-notify directly can supply any title, which is how the
+       "Candid submitted" leak happened. The prefix stays as a cheap fallback
+       for anything sent before the id record existed.
 
     Tags are deliberately NOT used. Rejecting on tags looked safe but silently
     swallowed genuine replies: if Frappppy ever sent one carrying a tag we
     happen to use (e.g. "hand"), the reply vanished with no error. Two earlier
     versions had this same class of bug - first on "any title", now on tags.
     """
-    return (m.get("title") or "").strip().lower().startswith("opencode")
+    if (m.get("title") or "").strip().lower().startswith("opencode"):
+        return True
+    mid = m.get("id")
+    return bool(mid) and mid in our_sent_ids()
 
 # A "I need you" prompt binds replies to that session, but only briefly —
 # after this, an unbound reply must ask rather than guess.

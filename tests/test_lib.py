@@ -349,6 +349,43 @@ def test_is_our_own_matches_own_titles():
     assert reply.is_our_own({"title": "please look", "tags": "hand"}) is False
 
 
+def test_is_our_own_recognises_our_ids_with_custom_titles():
+    # An agent's own status notice can carry any title ("Candid submitted"),
+    # so the title prefix alone misses it and the bridge steered it into a
+    # session as if the human had typed it. The id ntfy-notify recorded is
+    # the exact signal.
+    reply = load_script("ntfy_reply_mod", "ntfy-reply")
+    os.makedirs(os.path.dirname(reply.SENT_IDS_FILE), exist_ok=True)
+    try:
+        with open(reply.SENT_IDS_FILE, "w") as fh:
+            fh.write(f"msg_ours\t{time.time()}\n")
+        assert reply.is_our_own({"id": "msg_ours", "title": "Candid submitted"}) is True
+        # A genuine reply was never published by us, so its id is not there.
+        assert reply.is_our_own({"id": "msg_human", "title": "Candid submitted"}) is False
+    finally:
+        try:
+            os.remove(reply.SENT_IDS_FILE)
+        except OSError:
+            pass
+
+
+def test_sent_id_record_is_pruned():
+    # The record is bounded: entries older than the TTL must not match, or a
+    # stale id could mask a genuine reply that reused it.
+    reply = load_script("ntfy_reply_mod", "ntfy-reply")
+    os.makedirs(os.path.dirname(reply.SENT_IDS_FILE), exist_ok=True)
+    stale = time.time() - reply.SENT_IDS_TTL_S - 60
+    try:
+        with open(reply.SENT_IDS_FILE, "w") as fh:
+            fh.write(f"msg_old\t{stale}\n")
+        assert reply.is_our_own({"id": "msg_old", "title": "Candid submitted"}) is False
+    finally:
+        try:
+            os.remove(reply.SENT_IDS_FILE)
+        except OSError:
+            pass
+
+
 # ── health contract ───────────────────────────────────────────────────────
 def test_health_declares_three_way_exit_contract():
     health = load_script("ntfy_health_mod", "ntfy-health")

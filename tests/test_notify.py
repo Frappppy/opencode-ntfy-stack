@@ -520,6 +520,25 @@ def test_template_title_override():
         lst.close()
 
 
+def test_template_preserves_ampersand_and_backslash():
+    """Regression: bash >= 5.2 enables patsub_replacement by default, so an
+    unquoted '&' in the replacement of ${var//pat/repl} expands to the matched
+    text. The template substitution used to put the message in the replacement,
+    which published a literal "{msg}" wherever the message contained '&'."""
+    lst = Listener()
+    try:
+        _, env = sandbox(lst.url)
+        msg = 'verified & hardened C:\\temp "quoted" $HOME `cmd`'
+        res, sent = requests_to(lst, env, "-t", "info", msg)
+        assert res.returncode == 0, res.stderr
+        body = sent[0]["body"]
+        assert "{msg}" not in body, f"placeholder leaked/corrupted: {body!r}"
+        assert body.endswith(msg), f"message mangled: {body!r}"
+        assert "&" in body and "C:\\temp" in body, f"special chars lost: {body!r}"
+    finally:
+        lst.close()
+
+
 # ── daily budget ───────────────────────────────────────────────────────────
 def _seed_budget(env, n_success):
     """Record `n_success` delivered messages for TODAY in the metrics file."""
@@ -568,6 +587,35 @@ def test_routine_message_sends_below_budget():
         res, reqs = requests_to(lst, env, "fits", "budget")
         assert res.returncode == 0, f"want delivery, got {res.returncode}"
         assert len(reqs) == 1, f"want 1 request, got {len(reqs)}"
+    finally:
+        lst.close()
+
+
+def test_success_records_sent_message_id():
+    # The reply bridge recognises our own notifications by the id ntfy
+    # assigned, so a custom-titled notice ("Candid submitted") can no longer
+    # be routed back into a session as if the human had typed it.
+    lst = Listener(reply=(200, '{"id":"msg_abc","time":1,"event":"message"}'))
+    try:
+        _, env = sandbox(lst.url)
+        res, _ = requests_to(lst, env, "notice", "Candid submitted")
+        assert res.returncode == 0, res.returncode
+        assert "msg_abc" in read(state(env, "sent_ids")), read(state(env, "sent_ids"))
+    finally:
+        lst.close()
+
+
+def test_failed_send_records_no_id():
+    # Nothing may be recorded when the send failed — a recorded id would tell
+    # the bridge a message is ours when it never went out.
+    lst = Listener()
+    try:
+        _, env = sandbox(lst.url)
+        port = closed_port()
+        env["NTFY_SERVER"] = f"http://127.0.0.1:{port}"
+        res, _ = requests_to(lst, env, "nope", "nowhere")
+        assert res.returncode != 0, res.returncode
+        assert read(state(env, "sent_ids")) == ""
     finally:
         lst.close()
 

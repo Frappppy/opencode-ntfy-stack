@@ -22,13 +22,13 @@
 #   NTFY_DEDUP_WINDOW    deduplication window seconds (default: 30)
 #
 # Templates (extend in config):
-#   build_failed    🔴 Build failed — {message}
-#   deploy_done     🟢 Deployed — {message}
-#   error           💥 Error — {message}
-#   question        ❓ Need input — {message}
-#   info            ℹ️  Info — {message}
-#   success         ✅ Done — {message}
-#   warning         ⚠️  Warning — {message}
+#   build_failed    🔴 Build failed — {msg}
+#   deploy_done     🟢 Deployed — {msg}
+#   error           💥 Error — {msg}
+#   question        ❓ Need input — {msg}
+#   info            ℹ️  Info — {msg}
+#   success         ✅ Done — {msg}
+#   warning         ⚠️  Warning — {msg}
 
 set -uo pipefail
 
@@ -56,6 +56,13 @@ METRICS_FILE="$STATE_DIR/metrics.log"
 DEDUP_FILE="$STATE_DIR/dedup.log"
 PUBLISH_BLOCKED="$STATE_DIR/publish_blocked"
 LAST_RESPONSE="$STATE_DIR/last_response"
+# Every successful publish appends the id ntfy assigned to it. ntfy-reply
+# listens on the base topic (where Frappppy replies) and must not treat our
+# own notifications as replies; matching the id is exact, unlike the
+# title-prefix guess that missed custom-titled notices ("Candid submitted")
+# and fed them back into sessions as if the human had typed them.
+SENT_IDS_FILE="$STATE_DIR/sent_ids"
+SENT_IDS_TTL=$((48 * 3600))
 
 # ── templates ───────────────────────────────────────────────────────────
 declare -A TEMPLATES=(
@@ -165,6 +172,28 @@ dedup_record() {
   } 9>>"$DEDUP_FILE.lock"
 }
 
+# Record the id ntfy assigned to a message we just published, so the reply
+# bridge can recognise it as ours even when it was sent with a custom title
+# that does not start with "OpenCode". Two senders can run at once, so the
+# append and the prune share a lock (same pattern as dedup_record).
+record_sent_id() {
+  local id now cutoff
+  id=$(sed -n 's/.*"id":[[:space:]]*"\([^"]*\)".*/\1/p' "$LAST_RESPONSE" 2>/dev/null | head -1)
+  [[ -n "$id" ]] || return 0
+  now=$(date +%s)
+  cutoff=$((now - SENT_IDS_TTL))
+  {
+    flock 9
+    printf '%s\t%s\n' "$id" "$now" >>"$SENT_IDS_FILE"
+    if awk -F'\t' -v c="$cutoff" '$2 >= c' "$SENT_IDS_FILE" \
+         >"$SENT_IDS_FILE.tmp" 2>/dev/null; then
+      mv "$SENT_IDS_FILE.tmp" "$SENT_IDS_FILE"
+    else
+      rm -f "$SENT_IDS_FILE.tmp"
+    fi
+  } 9>>"$SENT_IDS_FILE.lock"
+}
+
 # desktop fallback
 desktop_fallback() {
   if command -v notify-send >/dev/null 2>&1; then
@@ -220,7 +249,12 @@ shift $((OPTIND-1))
 if [[ -n "$template" ]]; then
   if [[ -n "${TEMPLATES[$template]:-}" ]]; then
     message="${1:-}"
-    message="${TEMPLATES[$template]//\{msg\}/$message}"
+    # Strip the placeholder (empty replacement) and concatenate, rather than
+    # substituting $message into the replacement. bash >= 5.2 turns on
+    # patsub_replacement by default, so an unquoted '&' in a replacement
+    # expands to the matched text: a message containing '&' came out with the
+    # literal "{msg}" where the ampersand was.
+    message="${TEMPLATES[$template]//\{msg\}/}${message}"
     title="${2:-$(tr '[:lower:]' '[:upper:]' <<<${template:0:1})${template:1}}"
     tag="${3:-$template}"
   else
@@ -341,6 +375,7 @@ while (( attempt <= MAX_ATTEMPTS )); do
     echo "notified (HTTP $http_code, attempt $attempt): $title"
     log_metric "success" "$attempt" "$http_code" "$elapsed"
     dedup_record "$dedup_key"
+    record_sent_id
     rm -f "$PUBLISH_BLOCKED"
     circuit_reset
     exit 0

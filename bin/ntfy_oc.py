@@ -27,6 +27,14 @@ SERVICE = os.path.expanduser("~/.local/state/opencode/service.json")
 STATE_DIR = os.path.expanduser("~/.local/state/ntfy-heartbeat")
 NOTIFY = os.path.expanduser("~/.local/bin/ntfy-notify")
 
+# ntfy-notify keeps its own state here (metrics, markers, circuit). The reply
+# bridge reads the sent-id record from this dir to prove a base-topic message
+# is one of ours instead of guessing from the title.
+NOTIFY_STATE_DIR = os.path.join(
+    os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")),
+    "ntfy-notify")
+SENT_IDS_FILE = os.path.join(NOTIFY_STATE_DIR, "sent_ids")
+
 # ~/.config/ntfy-notify.conf is the same file ntfy-notify sources, so both
 # sides resolve the topic one way. The topic is the stack's only credential:
 # anyone who knows it can read and post to it, so it lives only in that

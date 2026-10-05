@@ -165,6 +165,13 @@ With one session running, a bare reply goes there. With several running and no
 recent question, the bridge **asks which one** rather than guessing — a
 mistyped number is surfaced, never silently misrouted.
 
+The bridge ignores the stack's *own* notifications even when their title isn't
+`OpenCode · …`: `ntfy-notify` records the id ntfy assigns to every message it
+publishes, and the bridge skips any base-topic message carrying one. Without
+that, an agent's status notice sent with a custom title ("Candid submitted")
+was treated as your reply and fed back into a session — the bot answering
+itself.
+
 ### Asking the human
 
 ```bash
@@ -291,8 +298,8 @@ and re-subscribe the phone.
 ## Testing
 
 ```bash
-python3 tests/test_notify.py     # 30 tests — the sender, end to end
-python3 tests/test_lib.py        # 38 tests — the library, reply routing, ask/events guards
+python3 tests/test_notify.py     # 33 tests — the sender, end to end
+python3 tests/test_lib.py        # 40 tests — the library, reply routing, ask/events guards
 python3 tests/test_install.py    # 11 tests — install/update/uninstall
 python3 tests/argcheck.py        # 35 assertions — flag/doc/portability drift
 ```
