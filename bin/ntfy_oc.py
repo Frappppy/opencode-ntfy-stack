@@ -35,6 +35,26 @@ NOTIFY_STATE_DIR = os.path.join(
     "ntfy-notify")
 SENT_IDS_FILE = os.path.join(NOTIFY_STATE_DIR, "sent_ids")
 
+
+def exec_announced_recently(session_id: str, window_s: int = 1800) -> bool:
+    """
+    True when ntfy-events announced this session's turn outcome recently.
+
+    ntfy-events writes exec:{sid}:{outcome} into events_seen.json (pruned to
+    the last hour) as a dedup key. The heartbeat reads it here so the same
+    finish is not announced a second time up to 15 minutes later.
+    """
+    try:
+        seen = json.load(open(os.path.join(STATE_DIR, "events_seen.json")))
+    except Exception:
+        return False
+    now = time.time()
+    for outcome in ("succeeded", "failed", "interrupted"):
+        ts = seen.get(f"exec:{session_id}:{outcome}")
+        if ts and (now - ts) < window_s:
+            return True
+    return False
+
 # ~/.config/ntfy-notify.conf is the same file ntfy-notify sources, so both
 # sides resolve the topic one way. The topic is the stack's only credential:
 # anyone who knows it can read and post to it, so it lives only in that

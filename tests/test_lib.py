@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import importlib.machinery
 import importlib.util
+import json
 import os
 import sqlite3
 import sys
@@ -476,18 +477,57 @@ def test_ask_same_words_different_session_sends():
 
 
 # ── events: only failures and interrupts buzz ──────────────────────────────
-def test_events_succeeded_turn_sends_nothing():
-    # Per-turn "Done" was 145 of 244 pings over five days, and it was always
-    # wrong-footed: sessions chain straight into the next turn (Viator said
-    # "Done" at 13:13:11 on Oct 2 and worked again by 13:15:51), so the phone
-    # showed "Done ✅ X" and then "1 working: X". ntfy-heartbeat's
-    # running→gone detector owns finish announcements now — it is the only
-    # signal that separates a real finish from a mid-work pause.
+def test_events_succeeded_quiet_while_session_still_running():
+    # A turn that chains straight into the next one is not a finish: the
+    # session is still running, so it must stay quiet (this was the old
+    # "Done ✅ X" then "1 working: X" misfire).
     ev = load_script("ntfy_events_mod", "ntfy-events")
     sent = []
     ev.send = lambda *a, **k: sent.append(a)
-    ev.handle_turn_end("ses_test", "succeeded", "some detail")
-    assert sent == [], f"succeeded turns must stay silent, got {sent!r}"
+    ev.STOP.wait = lambda t: False
+    original = ev.oc.running_sessions
+    ev.oc.running_sessions = lambda: [{"id": "ses_test", "title": "x"}]
+    try:
+        ev.handle_turn_end("ses_test", "succeeded", "some detail")
+    finally:
+        ev.oc.running_sessions = original
+    assert sent == [], f"a chained/active session must stay silent, got {sent!r}"
+
+
+def test_events_succeeded_pings_when_session_went_idle():
+    # The session left the running list -> it actually finished, so report it
+    # now rather than waiting up to a heartbeat tick.
+    ev = load_script("ntfy_events_mod", "ntfy-events")
+    sent = []
+    ev.send = lambda *a, **k: sent.append(a)
+    ev.STOP.wait = lambda t: False
+    ev.session_title = lambda sid: "Test Session"
+    ev.last_activity = lambda sid: "finished the work"
+    original = ev.oc.running_sessions
+    ev.oc.running_sessions = lambda: []
+    try:
+        ev.handle_turn_end("ses_test", "succeeded", "")
+    finally:
+        ev.oc.running_sessions = original
+    assert len(sent) == 1, f"an idle session must be reported once, got {sent!r}"
+    assert "Done" in sent[0][1], sent[0]
+
+
+def test_exec_announced_recently_reads_events_state():
+    # The heartbeat uses this to avoid re-announcing a finish ntfy-events
+    # already sent.
+    path = os.path.join(oc.STATE_DIR, "events_seen.json")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    try:
+        with open(path, "w") as fh:
+            json.dump({"exec:ses_a:succeeded": time.time()}, fh)
+        assert oc.exec_announced_recently("ses_a") is True
+        assert oc.exec_announced_recently("ses_b") is False
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
 
 def test_events_failure_and_interrupt_still_notify():

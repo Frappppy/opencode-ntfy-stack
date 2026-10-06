@@ -250,6 +250,23 @@ def send(body: str, title: str, tag: str, prio: str | None = None) -> None:
     else:
         log(f"sent: {title}")
 
+def session_went_idle(session_id: str, settle_s: float = 2.0) -> bool:
+    """
+    True when a just-succeeded session is no longer running.
+
+    A short settle lets the server move the session out of "running" before we
+    look, so a session that immediately chained into its next turn is still
+    running and is NOT reported as finished.
+    """
+    if STOP.wait(settle_s):
+        return False  # shutting down
+    try:
+        active = oc.running_sessions()
+    except Exception:
+        return False  # cannot tell -> stay quiet; the heartbeat will report it
+    return not any(s.get("id") == session_id for s in active)
+
+
 def handle_turn_end(session_id: str, outcome: str, detail: str) -> None:
     # Subagent completions are internal bookkeeping, not work the human is
     # waiting on — see oc.is_subagent(). The comment in dispatch() claimed
@@ -258,17 +275,19 @@ def handle_turn_end(session_id: str, outcome: str, detail: str) -> None:
         log(f"turn end on subagent {session_id}, not notifying")
         return
 
-    # A SUCCEEDED turn is not news on its own. Buzzing one per turn (2-minute
-    # dedup) produced 145 of 244 pings over five days, and the word "Done"
-    # was wrong: sessions chain straight into the next turn (Viator said
-    # "Done" at 13:13:11 on Oct 2 and was working again by 13:15:51), so the
-    # phone showed "Done ✅ X" and minutes later "1 working: X".
-    # Session-level finishes are announced ONCE by ntfy-heartbeat's
-    # running→gone detector — the only signal that separates a real finish
-    # from a mid-work pause. Failures and interrupts still buzz immediately,
-    # and catch-up still reports completions made while this daemon was down.
-    if outcome == "succeeded":
-        log(f"succeeded turn on {session_id} — finish is the heartbeat's to announce")
+    # A succeeded turn pings only when the session actually went idle — a real
+    # finish. Buzzing every turn (2-minute dedup) was 145 of 244 pings over
+    # five days and always wrong-footed: sessions chain straight into the next
+    # turn (Viator "Done" 13:13:11, working again 13:15:51), so the phone
+    # showed "Done ✅ X" and minutes later "1 working: X". Waiting for the
+    # 15-minute heartbeat instead was the opposite failure — a task could
+    # finish and then stay silent for up to 15 minutes. So check whether the
+    # session is still running: still running means it chained mid-work, stay
+    # quiet; gone means this is the finish, and it goes out now. Failures and
+    # interrupts always buzz, and catch-up still reports completions made
+    # while this daemon was down.
+    if outcome == "succeeded" and not session_went_idle(session_id):
+        log(f"succeeded turn on {session_id}, session still active — not notifying")
         return
 
     key = f"exec:{session_id}:{outcome}"

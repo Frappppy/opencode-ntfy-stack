@@ -416,6 +416,10 @@ def main() -> int:
     finished = [
         by_id[sid] for sid in set(prev) - now_ids if sid in by_id
     ]
+    # ntfy-events announces a finish the moment the session goes idle and
+    # records exec:{sid}:{outcome} in the shared state dir; drop anything it
+    # already reported so the same finish never buzzes twice.
+    finished = [f for f in finished if not oc.exec_announced_recently(f["id"])]
     # PREV_RUNNING is written only after a real send (see commit_state()).
 
     if args.json:

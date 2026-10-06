@@ -255,12 +255,14 @@ loop that outlives its caller is worse than no retry loop.
 sending meant a message that failed every attempt was marked sent, and the
 retry that mattered was swallowed as a duplicate.
 
-**A finished session pings once; a finished turn doesn't.** `ntfy-events`
-buzzes immediately for failed/interrupted turns and permission prompts (~8s),
-but a *successful* turn stays silent — buzzing each one was 145 of 244 pings
-over five days, and it always wrong-footed: sessions chain straight into the
-next turn, so "Done ✅ X" arrived while X kept working. The heartbeat's
-running→gone detector announces the session finish exactly once instead.
+**A session finish pings promptly; a mid-work turn doesn't.** `ntfy-events`
+buzzes immediately for failed/interrupted turns and permission prompts (~8s).
+A *successful* turn pings only once the session actually goes **idle** — the
+events daemon re-checks the running list a couple of seconds after the turn
+ends, so a session that chains straight into its next turn stays quiet (buzzing
+every turn was 145 of 244 pings over five days, and "Done ✅ X" kept arriving
+while X worked on). The 15-minute heartbeat is the fallback and skips anything
+events already reported.
 
 **Subagents don't ping you.** Background agents fire the same events as real
 sessions; `is_subagent()` filters them — and *fails open*, because dropping a
@@ -299,7 +301,7 @@ and re-subscribe the phone.
 
 ```bash
 python3 tests/test_notify.py     # 34 tests — the sender, end to end
-python3 tests/test_lib.py        # 41 tests — the library, reply routing, ask/events guards
+python3 tests/test_lib.py        # 43 tests — the library, reply routing, ask/events guards
 python3 tests/test_install.py    # 11 tests — install/update/uninstall
 python3 tests/argcheck.py        # 35 assertions — flag/doc/portability drift
 ```
