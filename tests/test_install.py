@@ -30,6 +30,7 @@ LIVE_UNITS = [
     "ntfy-heartbeat.timer",
     "ntfy-stuck.timer",
     "ntfy-health.timer",
+    "ntfy-outbox.timer",
 ]
 
 
@@ -98,8 +99,8 @@ def test_fresh_install_lays_down_everything():
     root, conf = sandbox()
     res = run(root, conf, "--no-enable", "--topic", "opencode-aaaabbbbccccddddeeeeffff")
     assert res.returncode == 0, res.stderr
-    assert count(os.path.join(root, ".local", "bin")) == 10, "want 10 scripts"
-    assert count(units_dir(conf)) == 9, f"want 9 units, got {count(units_dir(conf))}"
+    assert count(os.path.join(root, ".local", "bin")) == 11, "want 11 scripts"
+    assert count(units_dir(conf)) == 11, f"want 11 units, got {count(units_dir(conf))}"
 
 
 def test_installed_scripts_are_executable():
@@ -149,7 +150,8 @@ def test_sandbox_install_does_not_touch_systemd():
         f"  before: {before}\n  after : {after}\n"
         "  restore with: systemctl --user enable --now ntfy-events.service "
         "ntfy-reply.service ntfy-keepawake.service "
-        "ntfy-heartbeat.timer ntfy-stuck.timer ntfy-health.timer"
+        "ntfy-heartbeat.timer ntfy-stuck.timer ntfy-health.timer "
+        "ntfy-outbox.timer"
     )
 
 
@@ -173,7 +175,8 @@ def test_sandbox_uninstall_leaves_live_systemd_alone():
         f"  before: {before}\n  after : {after}\n"
         "  restore with: systemctl --user enable --now ntfy-events.service "
         "ntfy-reply.service ntfy-keepawake.service "
-        "ntfy-heartbeat.timer ntfy-stuck.timer ntfy-health.timer"
+        "ntfy-heartbeat.timer ntfy-stuck.timer ntfy-health.timer "
+        "ntfy-outbox.timer"
     )
 
 

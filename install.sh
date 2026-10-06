@@ -39,6 +39,7 @@ UNITS=(
   ntfy-heartbeat.timer
   ntfy-stuck.timer
   ntfy-health.timer
+  ntfy-outbox.timer
 )
 
 usage() {
@@ -100,7 +101,8 @@ if [[ "$MODE" == "uninstall" ]]; then
   done
   (( removed == 0 )) && info "no units found under $UNIT_DIR"
   for f in ntfy-notify ntfy_oc.py ntfy_activity.py ntfy-events ntfy-reply \
-           ntfy-heartbeat ntfy-stuck ntfy-health ntfy-finding ntfy-ask; do
+           ntfy-heartbeat ntfy-stuck ntfy-health ntfy-finding ntfy-ask \
+           ntfy-outbox; do
     [[ -f "$BIN_DIR/$f" ]] && { rm -f "$BIN_DIR/$f"; ok "removed $BIN_DIR/$f"; }
   done
   systemctl --user daemon-reload >/dev/null 2>&1 || true

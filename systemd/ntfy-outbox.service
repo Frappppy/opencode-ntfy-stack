@@ -1,0 +1,11 @@
+[Unit]
+Description=Retry notifications ntfy-notify could not deliver
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.local/bin/ntfy-outbox
+TimeoutStartSec=180
+
+[Install]
+WantedBy=default.target

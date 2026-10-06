@@ -22,6 +22,7 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 NOTIFY = os.path.normpath(os.path.join(HERE, "..", "bin", "ntfy-notify"))
+OUTBOX = os.path.normpath(os.path.join(HERE, "..", "bin", "ntfy-outbox"))
 TOPIC = "unit-test-topic"
 
 
@@ -621,6 +622,62 @@ def test_failed_send_records_no_id():
         assert read(state(env, "sent_ids")) == ""
     finally:
         lst.close()
+
+
+# ── outbox: a failed send is retried, never silently dropped ───────────────
+def _outbox_files(env):
+    d = state(env, "outbox")
+    return sorted(os.listdir(d)) if os.path.isdir(d) else []
+
+
+def _dead_env():
+    return sandbox(f"http://127.0.0.1:{closed_port()}")
+
+
+def test_exhausted_send_is_spooled():
+    _, env = _dead_env()
+    res = run(env, "cannot deliver this", "Spool me", "warning")
+    assert res.returncode != 0, res.returncode
+    files = _outbox_files(env)
+    assert len(files) == 1, files
+    raw = open(os.path.join(state(env, "outbox"), files[0]), "rb").read()
+    assert b"cannot deliver this" in raw, raw
+
+
+def test_flusher_failure_does_not_spool_a_duplicate():
+    # The outbox retries by calling ntfy-notify with NTFY_NO_SPOOL=1, so a
+    # still-failing retry leaves the one file rather than making another.
+    _, env = _dead_env()
+    run(env, "still stuck", "Stuck", "warning")
+    env["NTFY_NO_SPOOL"] = "1"
+    res = run(env, "still stuck", "Stuck", "warning")
+    assert res.returncode != 0
+    assert len(_outbox_files(env)) == 1, _outbox_files(env)
+
+
+def test_outbox_retries_and_clears_once_delivered():
+    lst = Listener()
+    try:
+        _, env = _dead_env()
+        assert run(env, "queued body", "Queued", "warning").returncode != 0
+        assert len(_outbox_files(env)) == 1
+        env["NTFY_SERVER"] = lst.url  # route recovers
+        res = subprocess.run([OUTBOX], env=env, capture_output=True,
+                             text=True, timeout=120)
+        assert res.returncode == 0, res.stderr
+        assert len(lst.requests) == 1, lst.requests
+        assert _outbox_files(env) == [], _outbox_files(env)
+    finally:
+        lst.close()
+
+
+def test_outbox_keeps_message_while_route_is_down():
+    _, env = _dead_env()
+    assert run(env, "still stuck", "Stuck", "warning").returncode != 0
+    res = subprocess.run([OUTBOX], env=env, capture_output=True,
+                         text=True, timeout=120)
+    assert res.returncode == 0, res.stderr
+    assert len(_outbox_files(env)) == 1, _outbox_files(env)
 
 
 def test_concurrent_sends_record_their_own_ids():

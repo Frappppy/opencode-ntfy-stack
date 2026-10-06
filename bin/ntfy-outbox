@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""
+ntfy-outbox — retry notifications that ntfy-notify could not deliver.
+
+ntfy-notify spools a message here only after every attempt failed, so a flaky
+route delays a notification instead of dropping it. This flusher runs from a
+timer, retries the oldest queued messages through the normal sender (retries,
+budget, dedup all still apply), and removes a file only once a send actually
+succeeds.
+
+    ntfy-outbox            retry what is queued (timer runs this)
+    ntfy-outbox --status   show how many are waiting
+    ntfy-outbox --dry      list what would be retried
+
+A message that stays undeliverable is kept for up to 24h, then dropped with a
+journal line — a bounded queue that says what it discarded rather than growing
+forever or lying about a send.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import subprocess
+import sys
+import time
+
+# Use the sender beside this script, never a path baked into the environment:
+# the repo copy and the installed copy must each talk to their own ntfy-notify.
+NOTIFY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ntfy-notify")
+STATE_DIR = os.path.join(
+    os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")),
+    "ntfy-notify")
+OUTBOX = os.path.join(STATE_DIR, "outbox")
+
+MAX_PER_RUN = 10
+MAX_AGE_S = 24 * 3600
+MAX_FILES = 300
+FIELDS = ("priority", "title", "tag", "group", "click", "message")
+
+
+def log(msg: str) -> None:
+    print(msg, flush=True)
+
+
+def read_msg(path: str) -> dict | None:
+    """Read a NUL-separated spool file. None when it is unreadable/legacy."""
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+    except OSError:
+        return None
+    parts = data.split(b"\x00")
+    if parts and parts[-1] == b"":
+        parts.pop()
+    if len(parts) < 6:
+        return None
+    return dict(zip(FIELDS, (p.decode("utf-8", "replace") for p in parts[:6])))
+
+
+def send(rec: dict) -> bool:
+    cmd = [NOTIFY, "-p", rec["priority"] or "default"]
+    if rec.get("click"):
+        cmd += ["-c", rec["click"]]
+    if rec.get("group"):
+        cmd += ["-g", rec["group"]]
+    cmd += [rec["message"], rec["title"], rec["tag"]]
+    env = dict(os.environ)
+    # A failure here must leave the file for the next run, not spool a copy.
+    env["NTFY_NO_SPOOL"] = "1"
+    try:
+        res = subprocess.run(cmd, env=env, capture_output=True, text=True,
+                             timeout=120)
+    except Exception as exc:  # noqa: BLE001
+        log(f"outbox: send error: {exc}")
+        return False
+    if res.returncode:
+        detail = (res.stderr or res.stdout).strip().splitlines()
+        log(f"outbox: still failing (rc {res.returncode}): "
+            f"{detail[-1][:160] if detail else ''}")
+        return False
+    return True
+
+
+def queue() -> list[str]:
+    if not os.path.isdir(OUTBOX):
+        return []
+    names = [n for n in os.listdir(OUTBOX) if n.endswith(".msg")]
+    return [os.path.join(OUTBOX, n) for n in sorted(names)]
+
+
+def prune(files: list[str]) -> None:
+    now = time.time()
+    for path in files:
+        try:
+            age = now - os.path.getmtime(path)
+        except OSError:
+            continue
+        if age > MAX_AGE_S:
+            try:
+                os.remove(path)
+                log(f"outbox: dropped {os.path.basename(path)} — undeliverable "
+                    f"for over {MAX_AGE_S // 3600}h")
+            except OSError:
+                pass
+    current = queue()
+    if len(current) > MAX_FILES:
+        for path in current[: len(current) - MAX_FILES]:
+            try:
+                os.remove(path)
+                log("outbox: dropped oldest — queue cap reached")
+            except OSError:
+                pass
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(add_help=True, description=__doc__)
+    ap.add_argument("--status", action="store_true", help="show queue depth")
+    ap.add_argument("--dry", action="store_true", help="list, do not send")
+    args = ap.parse_args()
+
+    files = queue()
+    prune(files)
+    files = queue()
+
+    if args.status or args.dry:
+        print(f"outbox: {len(files)} queued")
+        if args.dry:
+            for path in files:
+                rec = read_msg(path) or {}
+                print(f"  {os.path.basename(path)}  [{rec.get('title', '?')}]")
+        return 0
+
+    if not os.path.exists(NOTIFY):
+        log(f"outbox: sender missing at {NOTIFY}; leaving queue intact")
+        return 1
+
+    delivered = 0
+    for path in files[:MAX_PER_RUN]:
+        rec = read_msg(path)
+        if rec is None:
+            log(f"outbox: unreadable {os.path.basename(path)}; leaving it")
+            continue
+        if not send(rec):
+            break  # route is still down; do not hammer the rest
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        delivered += 1
+
+    if delivered:
+        log(f"outbox: delivered {delivered} queued message(s)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

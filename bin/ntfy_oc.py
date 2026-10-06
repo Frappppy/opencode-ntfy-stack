@@ -107,6 +107,7 @@ WATCHED_TIMERS = (
     "ntfy-heartbeat.timer",
     "ntfy-stuck.timer",
     "ntfy-health.timer",
+    "ntfy-outbox.timer",
 )
 
 # Column width for the short label, so rosters line up and scan on a phone.

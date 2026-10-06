@@ -47,6 +47,7 @@ swallowed.
 | **`ntfy-reply`** | service | Turns your phone texts into real input in a session. |
 | **`ntfy-ask`** | on demand | Multiple-choice questions with the session roster attached. |
 | **`ntfy-finding`** | on demand | Logs a finding in a greppable shape and pings you. |
+| **`ntfy-outbox`** | every 2 min | Retries a notification a failed send spooled — nothing is silently dropped. |
 | **`ntfy-keepawake`** | service | Stops the machine suspending out from under you. |
 | **`ntfy_oc.py`** | library | The single source of truth every tool imports. |
 
@@ -247,6 +248,12 @@ network attempt, leaving the last 50 slots for high/urgent traffic. Callers
 treat `3` like any failure: the heartbeat queues the message and re-renders
 it next tick, so nothing is lost — it goes out once the counter rolls over.
 
+**A failed send is retried, not dropped.** When every attempt fails, the
+sender spools the message (title, body, tag, priority) and the `ntfy-outbox`
+timer retries it every 2 minutes, deleting it **only** on a real delivery. The
+queue is bounded — 24h or 300 messages — and anything dropped past a bound is
+logged, never discarded in silence.
+
 **Send budget.** Every caller runs the sender under `timeout=120`, so the
 sender bounds its *whole* retry sequence — 90s critical, 30s routine. A retry
 loop that outlives its caller is worse than no retry loop.
@@ -300,10 +307,10 @@ and re-subscribe the phone.
 ## Testing
 
 ```bash
-python3 tests/test_notify.py     # 34 tests — the sender, end to end
+python3 tests/test_notify.py     # 38 tests — the sender, end to end
 python3 tests/test_lib.py        # 43 tests — the library, reply routing, ask/events guards
 python3 tests/test_install.py    # 11 tests — install/update/uninstall
-python3 tests/argcheck.py        # 35 assertions — flag/doc/portability drift
+python3 tests/argcheck.py        # 38 assertions — flag/doc/portability drift
 ```
 
 **Everything is sandboxed.** The suite runs the *real* scripts against a local
@@ -361,7 +368,7 @@ the problem it is reporting.
 
 ```
 opencode-ntfy-stack/
-├── bin/                    # the 10 scripts — installed to ~/.local/bin
+├── bin/                    # the 11 scripts — installed to ~/.local/bin
 │   ├── ntfy-notify         # bash sender: retries, dedup, markers, budget
 │   ├── ntfy_oc.py          # shared library (paths, API, roster, helpers)
 │   ├── ntfy_activity.py    # tool-call → plain-English phrases
@@ -371,7 +378,8 @@ opencode-ntfy-stack/
 │   ├── ntfy-stuck          # stall detector
 │   ├── ntfy-health         # stack watchdog
 │   ├── ntfy-finding        # greppable findings
-│   └── ntfy-ask            # multiple-choice questions
+│   ├── ntfy-ask            # multiple-choice questions
+│   └── ntfy-outbox         # retry notifications a failed send had spooled
 ├── systemd/                # user units → ~/.config/systemd/user
 ├── config/
 │   └── ntfy-notify.conf.example   # copied by install.sh (never committed filled in)
