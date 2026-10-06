@@ -369,6 +369,28 @@ def test_is_our_own_recognises_our_ids_with_custom_titles():
             pass
 
 
+def test_reply_cursor_advances_over_ignored_own_notices():
+    # Filtered self-notifications must still advance the base-topic cursor;
+    # otherwise the bridge re-fetches them forever and can misclassify one
+    # after its sent-id entry expires.
+    reply = load_script("ntfy_reply_mod", "ntfy-reply")
+    cursors = {reply.BASE_TOPIC: "m:before", reply.REPLY_TOPIC: "m:reply-before"}
+    events = {
+        reply.REPLY_TOPIC: [],
+        reply.BASE_TOPIC: [
+            ({"id": "own-1", "topic": reply.BASE_TOPIC}, True),
+            ({"id": "own-2", "topic": reply.BASE_TOPIC}, True),
+        ],
+    }
+    saved = []
+    reply.ensure_cursors = lambda: cursors
+    reply.stream_once = lambda _c: ([], cursors, events)
+    reply.save_cursors = lambda value: saved.append(value)
+    assert reply.drain() == 0
+    assert saved and saved[-1][reply.BASE_TOPIC] == "m:own-2", saved
+    assert saved[-1][reply.REPLY_TOPIC] == "m:reply-before", saved
+
+
 def test_sent_id_record_is_pruned():
     # The record is bounded: entries older than the TTL must not match, or a
     # stale id could mask a genuine reply that reused it.

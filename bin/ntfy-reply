@@ -595,7 +595,8 @@ def save_cursors(cursors: dict[str, str]) -> None:
     except Exception:
         pass
 
-def stream_once(cursors: dict[str, str]) -> tuple[list[dict], dict[str, str]]:
+def stream_once(cursors: dict[str, str]) -> tuple[
+        list[dict], dict[str, str], dict[str, list[tuple[dict, bool]]]]:
     """
     Read whatever is waiting. Returns (messages, newest cursor per topic).
 
@@ -610,6 +611,7 @@ def stream_once(cursors: dict[str, str]) -> tuple[list[dict], dict[str, str]]:
     """
     msgs: list[dict] = []
     newest = dict(cursors)
+    observed: dict[str, list[tuple[dict, bool]]] = {}
 
     for topic in dict.fromkeys([REPLY_TOPIC, BASE_TOPIC]):
         cursor = cursors.get(topic, "")
@@ -625,6 +627,7 @@ def stream_once(cursors: dict[str, str]) -> tuple[list[dict], dict[str, str]]:
             log(f"poll {topic} error: {exc} (cursor unchanged)")
             continue
 
+        topic_events: list[tuple[dict, bool]] = []
         for line in lines:
             line = line.strip()
             if not line:
@@ -637,13 +640,16 @@ def stream_once(cursors: dict[str, str]) -> tuple[list[dict], dict[str, str]]:
                 continue
             if not (m.get("message") or "").strip():
                 continue
-            if is_our_own(m):
-                continue
-            msgs.append(m)
+            m.setdefault("topic", topic)
             if m.get("id"):
                 newest[topic] = f"m:{m['id']}"
+            ours = is_our_own(m)
+            topic_events.append((m, ours))
+            if not ours:
+                msgs.append(m)
+        observed[topic] = topic_events
 
-    return msgs, newest
+    return msgs, newest, observed
 
 def _now_cursor() -> str:
     return f"t:{int(time.time())}"
@@ -664,7 +670,7 @@ def seed_cursor() -> None:
     """
     if os.path.exists(SEED_MARKER):
         return  # already initialised; never re-seed
-    _, newest = stream_once({})
+    _, newest, _ = stream_once({})
     fallback = _now_cursor()
     for topic in dict.fromkeys([REPLY_TOPIC, BASE_TOPIC]):
         newest.setdefault(topic, fallback)
@@ -702,8 +708,22 @@ def drain(once: bool = False) -> int:
     cursors = ensure_cursors()
     if not cursors:
         return 0
-    msgs, _ = stream_once(cursors)
+    msgs, _, observed = stream_once(cursors)
     if not msgs:
+        # Own notifications are intentionally filtered from the reply list,
+        # but still advance the base-topic cursor. Otherwise the bridge polls
+        # the same outgoing notifications forever; once their sent-id record
+        # expires, a retained notice can be mistaken for a fresh human reply.
+        updated = dict(cursors)
+        for topic, events in observed.items():
+            for m, ours in events:
+                if not ours:
+                    break
+                mid = m.get("id")
+                if mid:
+                    updated[topic] = f"m:{mid}"
+        if updated != cursors:
+            save_cursors(updated)
         return 0
     log(f"received {len(msgs)} reply/replies")
     batch = msgs[:MAX_BATCH]
@@ -713,11 +733,18 @@ def drain(once: bool = False) -> int:
     # Advance each topic only as far as messages we ACTUALLY handled. A
     # message past MAX_BATCH keeps its old cursor and returns next pass —
     # moving straight to `latest` used to drop it silently.
+    handled = {(m.get("topic"), m.get("id")) for m in batch}
     updated = dict(cursors)
-    for m in batch:
-        topic, mid = m.get("topic"), m.get("id")
-        if topic and mid:
-            updated[topic] = f"m:{mid}"
+    for topic, events in observed.items():
+        for m, ours in events:
+            mid = m.get("id")
+            if not mid:
+                continue
+            if ours or (topic, mid) in handled:
+                updated[topic] = f"m:{mid}"
+            else:
+                # Do not move past a real reply we have not processed yet.
+                break
     if updated != cursors:
         save_cursors(updated)
     if len(msgs) > len(batch):

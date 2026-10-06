@@ -56,6 +56,11 @@ METRICS_FILE="$STATE_DIR/metrics.log"
 DEDUP_FILE="$STATE_DIR/dedup.log"
 PUBLISH_BLOCKED="$STATE_DIR/publish_blocked"
 LAST_RESPONSE="$STATE_DIR/last_response"
+# A notifier may run concurrently with heartbeat/events/ask. Keep the response
+# used to record this send's ntfy id private to this process: sharing
+# LAST_RESPONSE let concurrent sends overwrite each other's ids.
+RESPONSE_FILE="$STATE_DIR/response.$$.json"
+trap 'rm -f "$RESPONSE_FILE"' EXIT
 # Every successful publish appends the id ntfy assigned to it. ntfy-reply
 # listens on the base topic (where Frappppy replies) and must not treat our
 # own notifications as replies; matching the id is exact, unlike the
@@ -178,7 +183,7 @@ dedup_record() {
 # append and the prune share a lock (same pattern as dedup_record).
 record_sent_id() {
   local id now cutoff
-  id=$(sed -n 's/.*"id":[[:space:]]*"\([^"]*\)".*/\1/p' "$LAST_RESPONSE" 2>/dev/null | head -1)
+  id=$(sed -n 's/.*"id":[[:space:]]*"\([^"]*\)".*/\1/p' "$RESPONSE_FILE" 2>/dev/null | head -1)
   [[ -n "$id" ]] || return 0
   now=$(date +%s)
   cutoff=$((now - SENT_IDS_TTL))
@@ -207,7 +212,7 @@ send_one() {
   # No -f: with it curl throws away the response body on an error, and that
   # body is the ONLY place ntfy says why it refused us (e.g. "daily message
   # quota reached"). Success is decided from the status code instead.
-  local curl_args=(-4 -sS -m "$CURL_TIMEOUT" -o "$LAST_RESPONSE" -w "%{http_code}")
+  local curl_args=(-4 -sS -m "$CURL_TIMEOUT" -o "$RESPONSE_FILE" -w "%{http_code}")
 
   [[ -n "$AUTH" ]] && curl_args+=(-H "Authorization: Bearer $AUTH")
 
@@ -222,6 +227,12 @@ send_one() {
   local code
   code=$(curl "${curl_args[@]}" "$SERVER/$TOPIC")
   local rc=$?
+  # Keep the last response for diagnostics, but never read it back to
+  # associate an id with this send (another process may replace it).
+  if [[ -f "$RESPONSE_FILE" ]]; then
+    cp "$RESPONSE_FILE" "$LAST_RESPONSE.tmp.$$" 2>/dev/null &&
+      mv "$LAST_RESPONSE.tmp.$$" "$LAST_RESPONSE" 2>/dev/null || true
+  fi
   printf '%s' "$code"
   [[ $rc -eq 0 && "$code" == 2?? ]]
 }
@@ -416,7 +427,7 @@ log_metric "exhausted" "$tried" "${http_code:-000}" "$total_elapsed"
 # successful publish.
 if [[ "${http_code:-}" == "429" ]]; then
   printf '%s\n%s\n' "$(date +%s)" \
-    "$(head -c 300 "$LAST_RESPONSE" 2>/dev/null | tr -d '\n')" >"$PUBLISH_BLOCKED"
+    "$(head -c 300 "$RESPONSE_FILE" 2>/dev/null | tr -d '\n')" >"$PUBLISH_BLOCKED"
 fi
 
 circuit_trip

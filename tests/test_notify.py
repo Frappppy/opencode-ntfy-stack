@@ -11,6 +11,7 @@ state, and never reaches your phone.
 """
 from __future__ import annotations
 
+import concurrent.futures
 import os
 import socket
 import subprocess
@@ -82,15 +83,17 @@ class Listener:
                 if ":" in line:
                     k, v = line.split(":", 1)
                     headers[k.strip().lower()] = v.strip()
-            self.requests.append({
+            request = {
                 "path": lines[0] if lines else "",
                 "headers": headers,
                 "body": rest.decode(errors="replace"),
-            })
+            }
+            self.requests.append(request)
 
             if self.delay:
                 time.sleep(self.delay)
-            status, body = self.reply
+            response = self.reply(request) if callable(self.reply) else self.reply
+            status, body = response
             payload = body.encode()
             conn.sendall(
                 b"HTTP/1.1 %d X\r\nContent-Type: application/json\r\n"
@@ -616,6 +619,31 @@ def test_failed_send_records_no_id():
         res, _ = requests_to(lst, env, "nope", "nowhere")
         assert res.returncode != 0, res.returncode
         assert read(state(env, "sent_ids")) == ""
+    finally:
+        lst.close()
+
+
+def test_concurrent_sends_record_their_own_ids():
+    # Heartbeat and events can publish simultaneously. Each response has a
+    # distinct id, so this catches any regression to a shared response file
+    # where one process can record the other process's ntfy id.
+    def response_for(request):
+        title = request["headers"].get("title", "")
+        token = title.rsplit(" ", 1)[-1]
+        return 200, '{"id":"id_' + token + '"}'
+
+    lst = Listener(reply=response_for, delay=0.05)
+    try:
+        _, env = sandbox(lst.url)
+        titles = [f"parallel notice {i:02d}" for i in range(12)]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
+            futures = [pool.submit(run, env, f"body {i}", title)
+                       for i, title in enumerate(titles)]
+            results = [f.result(timeout=60) for f in futures]
+        assert all(r.returncode == 0 for r in results), [r.stderr for r in results]
+        recorded = read(state(env, "sent_ids"))
+        missing = [f"id_{i:02d}" for i in range(12) if f"id_{i:02d}\t" not in recorded]
+        assert not missing, f"concurrent response IDs were lost/mismatched: {missing}"
     finally:
         lst.close()
 
