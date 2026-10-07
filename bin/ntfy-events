@@ -157,7 +157,7 @@ def catchup_missed_turns() -> None:
         icon = {"succeeded": "Done", "failed": "Failed"}.get(outcome, "Finished")
         body = f"{mark} {title or sid}" + (f"\n  {act}" if act else "")
         send(body, f"OpenCode · {icon} (while away)",
-             "white_check_mark" if outcome == "succeeded" else "x")
+             "white_check_mark" if outcome == "succeeded" else "x", "high")
         reported += 1
 
     if reported:
@@ -305,13 +305,13 @@ def handle_turn_end(session_id: str, outcome: str, detail: str) -> None:
     act = last_activity(session_id)
 
     if outcome == "succeeded":
-        mark, icon, prio = "✅", "Done", None
+        mark, icon, prio = "✅", "Done", "high"
         tag = "white_check_mark"
     elif outcome == "failed":
         mark, icon, prio = "❌", "Failed", "high"
         tag = "x"
     else:
-        mark, icon, prio = "⏹", "Interrupted", "default"
+        mark, icon, prio = "⏹", "Interrupted", "high"
         tag = "no_entry"
 
     # One line, plain English. The notification title carries the status so

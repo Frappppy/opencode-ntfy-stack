@@ -531,9 +531,15 @@ def main() -> int:
         print(f"missing {NOTIFY}", file=sys.stderr)
         return 1
 
-    cmd = [NOTIFY, "-g", "heartbeat"]
-    if prio:
-        cmd += ["-p", prio]
+    # Every heartbeat goes out high priority so Android's Doze delivers it
+    # promptly. A plain roster is flagged routine so the daily budget can
+    # still skip it (the heartbeat queues and re-renders next tick); a
+    # "needs you" or failed message is not routine and always attempts.
+    failed_any = any((f.get("outcome") or "") not in ("succeeded", "")
+                     for f in finished)
+    cmd = [NOTIFY, "-g", "heartbeat", "-p", prio or "high"]
+    if not new_blocked and not failed_any:
+        cmd += ["-r"]
     cmd += [body, title, tag]
     res = subprocess.run(cmd, capture_output=True, text=True)
     if not res.returncode:

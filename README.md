@@ -243,10 +243,18 @@ marker.
 **Daily budget.** ntfy.sh allows 250 publishes per IP per day; the first
 heavy day hit the wall at noon and *everything* — permissions, questions,
 failures — was refused until midnight. Past 200 delivered messages, routine
-(default/low) sends are refused **locally** with exit `3`, before spending a
-network attempt, leaving the last 50 slots for high/urgent traffic. Callers
-treat `3` like any failure: the heartbeat queues the message and re-renders
-it next tick, so nothing is lost — it goes out once the counter rolls over.
+sends are refused **locally** with exit `3`, before spending a network
+attempt, leaving the last 50 slots for high/urgent traffic. “Routine” means
+default/low priority, or anything flagged `-r` (the heartbeat marks itself
+routine). Callers treat `3` like any failure: the heartbeat queues the message
+and re-renders it next tick, so nothing is lost — it goes out once the counter
+rolls over.
+
+**Everything goes out high priority.** Android's Doze can hold a
+default-priority notification until its next maintenance window — the classic
+“arrived late.” Every phone ping is therefore sent as `priority: high` (which
+wakes the device) while the routine ones stay under the budget above, so
+promptness no longer costs quota discipline.
 
 **A failed send is retried, not dropped.** When every attempt fails, the
 sender spools the message (title, body, tag, priority) and the `ntfy-outbox`
@@ -314,10 +322,10 @@ and re-subscribe the phone.
 ## Testing
 
 ```bash
-python3 tests/test_notify.py     # 38 tests — the sender, end to end
+python3 tests/test_notify.py     # 40 tests — the sender, end to end
 python3 tests/test_lib.py        # 46 tests — the library, reply routing, ask/events guards
 python3 tests/test_install.py    # 11 tests — install/update/uninstall
-python3 tests/argcheck.py        # 38 assertions — flag/doc/portability drift
+python3 tests/argcheck.py        # 39 assertions — flag/doc/portability drift
 ```
 
 **Everything is sandboxed.** The suite runs the *real* scripts against a local

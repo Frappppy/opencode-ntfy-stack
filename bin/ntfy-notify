@@ -83,12 +83,14 @@ declare -A TEMPLATES=(
 # ── usage ───────────────────────────────────────────────────────────────
 usage() {
   cat <<'EOF'
-ntfy-notify [-p priority] [-c click_url] [-t template] [-g group] "message" [title] [tag]
+ntfy-notify [-p priority] [-c click_url] [-t template] [-g group] [-r] "message" [title] [tag]
 
   -p  priority: min low default high max urgent
   -c  URL to open when tapped
   -t  template: build_failed|deploy_done|error|question|info|success|warning
   -g  group key (threads related notifications)
+  -r  routine: may be skipped once the daily budget is reached (yet still sent
+      high priority, so the phone wakes for it)
   -h  help
 
 Examples:
@@ -266,13 +268,15 @@ priority="default"
 click_url=""
 template=""
 group=""
+routine=false
 
-while getopts ":p:c:t:g:h" opt; do
+while getopts ":p:c:t:g:hr" opt; do
   case $opt in
     p) priority="$OPTARG" ;;
     c) click_url="$OPTARG" ;;
     t) template="$OPTARG" ;;
     g) group="$OPTARG" ;;
+    r) routine=true ;;
     h) usage 0 ;;
     \?) echo "Invalid option: -$OPTARG" >&2; usage ;;
     :) echo "Option -$OPTARG requires an argument" >&2; usage ;;
@@ -345,7 +349,7 @@ esac
 # refuses with 429 and the publish_blocked marker takes over from there.
 # The count is successes only — failed attempts cost no quota.
 ROUTINE_BUDGET=200
-if ! $critical; then
+if $routine || ! $critical; then
   used_today=$(awk -F'\t' -v d="$(date +%F)" \
     '$1 ~ "^"d && $3 == "success" {n++} END {print n+0}' \
     "$METRICS_FILE" 2>/dev/null)

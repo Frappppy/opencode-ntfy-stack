@@ -583,6 +583,33 @@ def test_high_priority_bypasses_budget():
         lst.close()
 
 
+def test_routine_high_priority_is_still_budget_gated():
+    # The heartbeat sends high priority so Android's Doze delivers it
+    # promptly, but marks itself routine so the daily budget can still skip it
+    # before the quota wall. High priority alone must NOT lift that.
+    lst = Listener()
+    try:
+        _, env = sandbox(lst.url)
+        _seed_budget(env, 200)
+        res, reqs = requests_to(lst, env, "-p", "high", "-r", "routine", "hb")
+        assert res.returncode == 3, f"want exit 3, got {res.returncode}"
+        assert reqs == [], "a routine message must not reach the network at cap"
+    finally:
+        lst.close()
+
+
+def test_routine_flag_accepted_and_sent_high_below_budget():
+    lst = Listener()
+    try:
+        _, env = sandbox(lst.url)
+        res, reqs = requests_to(lst, env, "-p", "high", "-r", "roster", "hb")
+        assert res.returncode == 0, res.returncode
+        assert len(reqs) == 1, reqs
+        assert reqs[0]["headers"].get("priority") == "high", reqs[0]["headers"]
+    finally:
+        lst.close()
+
+
 def test_routine_message_sends_below_budget():
     lst = Listener()
     try:
