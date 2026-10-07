@@ -283,11 +283,17 @@ def handle_turn_end(session_id: str, outcome: str, detail: str) -> None:
     # 15-minute heartbeat instead was the opposite failure — a task could
     # finish and then stay silent for up to 15 minutes. So check whether the
     # session is still running: still running means it chained mid-work, stay
-    # quiet; gone means this is the finish, and it goes out now. Failures and
-    # interrupts always buzz, and catch-up still reports completions made
-    # while this daemon was down.
-    if outcome == "succeeded" and not session_went_idle(session_id):
-        log(f"succeeded turn on {session_id}, session still active — not notifying")
+    # quiet; gone means this is the finish, and it goes out now.
+    #
+    # An INTERRUPTED turn gets the same check. Interruptions are usually
+    # internal — OpenCode supersedes a running execution when a tool reloads
+    # or retries and the session keeps working — so pinging every one was
+    # noise (25 "Interrupted" pings in three days, more than "Done"). Only a
+    # stop that actually parks the session is worth waking someone for.
+    # Failures always buzz, and catch-up still reports completions made while
+    # this daemon was down.
+    if outcome in ("succeeded", "interrupted") and not session_went_idle(session_id):
+        log(f"{outcome} turn on {session_id}, session still active — not notifying")
         return
 
     key = f"exec:{session_id}:{outcome}"

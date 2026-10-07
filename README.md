@@ -263,13 +263,20 @@ sending meant a message that failed every attempt was marked sent, and the
 retry that mattered was swallowed as a duplicate.
 
 **A session finish pings promptly; a mid-work turn doesn't.** `ntfy-events`
-buzzes immediately for failed/interrupted turns and permission prompts (~8s).
-A *successful* turn pings only once the session actually goes **idle** — the
+buzzes immediately for failed turns and permission prompts (~8s). A
+*successful* turn pings only once the session actually goes **idle** — the
 events daemon re-checks the running list a couple of seconds after the turn
 ends, so a session that chains straight into its next turn stays quiet (buzzing
 every turn was 145 of 244 pings over five days, and "Done ✅ X" kept arriving
-while X worked on). The 15-minute heartbeat is the fallback and skips anything
-events already reported.
+while X worked on). An **interrupted** turn gets the same check: internal
+supersedes (a tool reloading or retrying) leave the session running and stay
+quiet; only a stop that parks the session pings. The 15-minute heartbeat is the
+fallback and skips anything events already reported.
+
+**“Needs your input” means exactly that.** A form or inbox item is reported
+only for a session that is **not** running — a working session's leftovers are
+not a wait on you. (Reporting them produced "2 sessions working" and "1 inbox
+waiting" in the same message.)
 
 **Subagents don't ping you.** Background agents fire the same events as real
 sessions; `is_subagent()` filters them — and *fails open*, because dropping a
@@ -308,7 +315,7 @@ and re-subscribe the phone.
 
 ```bash
 python3 tests/test_notify.py     # 38 tests — the sender, end to end
-python3 tests/test_lib.py        # 43 tests — the library, reply routing, ask/events guards
+python3 tests/test_lib.py        # 46 tests — the library, reply routing, ask/events guards
 python3 tests/test_install.py    # 11 tests — install/update/uninstall
 python3 tests/argcheck.py        # 38 assertions — flag/doc/portability drift
 ```

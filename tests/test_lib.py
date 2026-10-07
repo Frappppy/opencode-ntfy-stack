@@ -531,21 +531,75 @@ def test_exec_announced_recently_reads_events_state():
 
 
 def test_events_failure_and_interrupt_still_notify():
-    # Failures and interrupts are immediate news regardless of the flood fix —
-    # a task dying is exactly when the phone should buzz.
+    # A failed turn always buzzes; an interrupt buzzes when it actually parks
+    # the session (here: the running list is empty).
     ev = load_script("ntfy_events_mod", "ntfy-events")
     sent = []
     ev.send = lambda *a, **k: sent.append(a)
-    # The sandbox has no OpenCode store; stub the lookups the handler does
-    # after the subagent check (module-level aliases, so oc stays untouched).
+    ev.STOP.wait = lambda t: False
     ev.session_title = lambda sid: "Test Session"
     ev.last_activity = lambda sid: "ran a command"
-    ev.handle_turn_end("ses_test", "failed", "boom")
-    ev.handle_turn_end("ses_test", "interrupted", "user stopped it")
+    original = ev.oc.running_sessions
+    ev.oc.running_sessions = lambda: []
+    try:
+        ev.handle_turn_end("ses_test", "failed", "boom")
+        ev.handle_turn_end("ses_test", "interrupted", "user stopped it")
+    finally:
+        ev.oc.running_sessions = original
     assert len(sent) == 2, f"want 2 notifications, got {len(sent)}"
     titles = [c[1] for c in sent]
     assert any("Failed" in t for t in titles), titles
     assert any("Interrupted" in t for t in titles), titles
+
+
+def test_events_interrupt_quiet_while_session_still_running():
+    # An internal supersede (a tool reloading or retrying) leaves the session
+    # running; pinging those was 25 of the last three days' notifications.
+    ev = load_script("ntfy_events_mod", "ntfy-events")
+    sent = []
+    ev.send = lambda *a, **k: sent.append(a)
+    ev.STOP.wait = lambda t: False
+    ev.session_title = lambda sid: "Test Session"
+    ev.last_activity = lambda sid: "did work"
+    original = ev.oc.running_sessions
+    ev.oc.running_sessions = lambda: [{"id": "ses_test", "title": "x"}]
+    try:
+        ev.handle_turn_end("ses_test", "interrupted", "")
+    finally:
+        ev.oc.running_sessions = original
+    assert sent == [], f"an interrupted-but-running session must be quiet, got {sent!r}"
+
+
+def test_needs_you_ignores_inbox_of_a_running_session():
+    # A running session is still working; a leftover inbox/form item is not a
+    # wait on the human. Reporting it produced "N working" plus "1 inbox
+    # waiting" in one message.
+    hb = load_script("ntfy_heartbeat_mod", "ntfy-heartbeat")
+    sessions = [{"id": "ses_run", "title": "Running one"},
+                {"id": "ses_idle", "title": "Idle one"}]
+
+    def fake_get(base, pw, path, timeout=8.0):
+        if path == "/api/permission/request":
+            return {"data": []}
+        if "ses_idle" in path and path.endswith("/inbox"):
+            return {"data": [{"id": 1}]}
+        if "ses_run" in path and path.endswith("/inbox"):
+            return {"data": [{"id": 1}]}
+        return {"data": []}
+
+    hb.api_get = fake_get
+    out = hb.needs_you("http://x", "pw", sessions, running_ids=["ses_run"])
+    assert any("Idle one" in x for x in out), out
+    assert not any("Running one" in x for x in out), out
+
+
+def test_stuck_ignores_browser_orchestration_repeats():
+    # Identical 'execute' calls are normal browser navigation (the Glassdoor
+    # session ran one 8 times while the page loaded), so that tool is not
+    # repeat-counted, and the 3x-with-failures shortcut is gone.
+    stuck = load_script("ntfy_stuck_mod", "ntfy-stuck")
+    assert "execute" not in stuck.REPEATABLE
+    assert stuck.REPEAT_ALERT_FAILED >= stuck.REPEAT_ALERT
 
 
 # ── runner ────────────────────────────────────────────────────────────────

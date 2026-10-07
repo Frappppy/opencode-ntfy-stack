@@ -55,13 +55,21 @@ def api_get(base: str, pw: str, path: str, timeout: float = 8.0) -> dict:
     return oc.api(base, pw, path, timeout=timeout)
 
 # ── "is anything blocked waiting on YOU" ────────────────────────────────────
-def needs_you(base: str, pw: str, sessions: list[dict]) -> list[str]:
+def needs_you(base: str, pw: str, sessions: list[dict],
+              running_ids: list[str] | None = None) -> list[str]:
     """
     Sessions that are stalled on the human: permission prompts, forms and
     inbox items. These are NOT 'running', so the normal filter would hide
     them — but they are exactly when the phone should buzz.
+
+    A form/inbox item is only reported for a session that is NOT currently
+    running: a running session is still working, so an item it left behind
+    (a stale inbox entry, a form from an earlier turn) is not a wait on you.
+    Reporting those produced "N working" and "1 inbox waiting" in the same
+    message — a false alarm.
     """
     out: list[str] = []
+    running = set(running_ids or ())
     by_id = {s["id"]: s for s in sessions}
     who = lambda sid: (by_id.get(sid) or {}).get("title") or "a session"
 
@@ -76,8 +84,8 @@ def needs_you(base: str, pw: str, sessions: list[dict]) -> list[str]:
     except Exception:
         pass
 
-    # forms/inbox are per-session; only probe sessions that exist
-    for sid in list(by_id):
+    # forms/inbox are per-session; skip sessions that are still working
+    for sid in [s for s in by_id if s not in running]:
         for path, icon, label in (
             ("/api/session/{}/form", "📝", "form"),
             ("/api/session/{}/inbox", "📥", "inbox"),
@@ -388,7 +396,7 @@ def main() -> int:
 
     # Anything blocked on the human — this is the "ping me when you need me"
     # case, and it must be reported even when no session is 'running'.
-    blocked = needs_you(base, pw, sessions)
+    blocked = needs_you(base, pw, sessions, running_ids)
 
     # A standing permission prompt stays visible across ticks, so only
     # announce it when the SET of blocked items actually changes.

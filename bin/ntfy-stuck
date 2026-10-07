@@ -41,7 +41,9 @@ NOTIFY = oc.NOTIFY
 
 LOOKBACK_MS = 25 * 60 * 1000     # how much history to consider
 REPEAT_ALERT = 4                  # same command this many times -> alert
-REPEAT_ALERT_FAILED = 3           # ...or 3x if the repeats were failing
+REPEAT_ALERT_FAILED = 4           # same bar when the repeats were failing: a
+                                  # 3x shortcut fired on normal browser work
+                                  # (a script retried while a page loaded)
 CONSEC_FAILURES = 4               # this many failures in a row -> alert
 DRIFT_MINUTES = 12                # "running" but silent this long -> alert
 COOLDOWN_S = 45 * 60              # don't re-alert the same session sooner
@@ -83,7 +85,7 @@ STORE_ERRORS: list[str] = []
 # refinement, not a loop. Repeat detection only applies to tools where doing
 # the identical thing again implies the previous attempt didn't work.
 REPEATABLE = {
-    "shell", "bash", "execute", "webfetch", "websearch", "grep", "glob",
+    "shell", "bash", "webfetch", "websearch", "grep", "glob",
     "read", "task", "agent",
 }
 REPEAT_PREFIXES = ("browser",)
