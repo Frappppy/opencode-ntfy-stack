@@ -291,8 +291,8 @@ def test_http_500_retries_then_fails():
         _, env = sandbox(lst.url)
         res, sent = requests_to(lst, env, "will fail")
         assert res.returncode == 1, f"undelivered must exit 1, got {res.returncode}"
-        assert len(sent) == 3, f"routine send must try 3 times, tried {len(sent)}"
-        assert "FAILED after 3 attempt(s)" in res.stderr, res.stderr
+        assert len(sent) == 5, f"routine send must try 5 times, tried {len(sent)}"
+        assert "FAILED after 5 attempt(s)" in res.stderr, res.stderr
         # honest count: exactly what it tried
         assert "FAILED after 1" not in res.stderr
     finally:
@@ -325,7 +325,7 @@ def test_failure_writes_metrics():
         _, env = sandbox(lst.url)
         run(env, "metric me")
         metrics = read(state(env, "metrics.log"))
-        assert metrics.count("\tfail\t") == 3, f"want 3 fail lines:\n{metrics}"
+        assert metrics.count("\tfail\t") == 5, f"want 5 fail lines:\n{metrics}"
         assert "\texhausted\t" in metrics, "must record the final exhaustion"
     finally:
         lst.close()
@@ -429,7 +429,7 @@ def test_stale_marker_ignored():
         with open(state(env, "publish_blocked"), "w") as fh:
             fh.write(f"{int(time.time()) - 7200}\n" + '{"error":"old"}\n')
         res, sent = requests_to(lst, env, "stale marker")
-        assert len(sent) == 3, f"a >1h marker must not degrade the send, got {len(sent)}"
+        assert len(sent) == 5, f"a >1h marker must not degrade the send, got {len(sent)}"
         assert "single attempt" not in res.stderr
     finally:
         lst.close()

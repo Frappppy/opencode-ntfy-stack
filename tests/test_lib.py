@@ -602,6 +602,49 @@ def test_stuck_ignores_browser_orchestration_repeats():
     assert stuck.REPEAT_ALERT_FAILED >= stuck.REPEAT_ALERT
 
 
+def test_outbox_read_msg_roundtrip():
+    ob = load_script("ntfy_outbox_mod", "ntfy-outbox")
+    d = tempfile.mkdtemp()
+    p = os.path.join(d, "x.msg")
+    with open(p, "wb") as fh:
+        fh.write(b"\x00".join([b"high", b"Title", b"tag", b"g", b"c", b"body"]) + b"\x00")
+    rec = ob.read_msg(p)
+    assert rec["priority"] == "high" and rec["title"] == "Title" and rec["message"] == "body", rec
+    assert ob.read_msg(os.path.join(d, "missing.msg")) is None
+
+
+def test_outbox_drains_past_a_failing_message():
+    # The route is intermittently up: a failed send must not stall the rest of
+    # the queue. The outbox should keep going and deliver every file.
+    ob = load_script("ntfy_outbox_mod", "ntfy-outbox")
+    d = tempfile.mkdtemp()
+    ob.OUTBOX = d
+
+    calls = {"n": 0}
+    def fake_send(rec):
+        calls["n"] += 1
+        return calls["n"] != 1  # fail only the very first attempt
+    ob.send = fake_send
+
+    for i in range(3):
+        with open(os.path.join(d, f"{i}.msg"), "wb") as fh:
+            fh.write(b"\x00".join(
+                s.encode() for s in ("high", "t", "tag", "", "", f"msg{i}")) + b"\x00")
+
+    old_argv = sys.argv
+    sys.argv = ["ntfy-outbox"]
+    try:
+        ob.main()
+    finally:
+        sys.argv = old_argv
+
+    # The first call fails (by design), so its file must stay; the other two
+    # must still be attempted and drained — that is what `continue` buys us.
+    remaining = [n for n in os.listdir(d) if n.endswith(".msg")]
+    assert remaining == ["0.msg"], f"only the failed file should remain, left: {remaining}"
+    assert calls["n"] == 3, f"should have attempted all three, got {calls['n']}"
+
+
 # ── runner ────────────────────────────────────────────────────────────────
 def main():
     want = sys.argv[1:] if len(sys.argv) > 1 else None

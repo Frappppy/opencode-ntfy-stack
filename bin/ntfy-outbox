@@ -32,7 +32,7 @@ STATE_DIR = os.path.join(
     "ntfy-notify")
 OUTBOX = os.path.join(STATE_DIR, "outbox")
 
-MAX_PER_RUN = 10
+MAX_PER_RUN = 25
 MAX_AGE_S = 24 * 3600
 MAX_FILES = 300
 FIELDS = ("priority", "title", "tag", "group", "click", "message")
@@ -141,7 +141,9 @@ def main() -> int:
             log(f"outbox: unreadable {os.path.basename(path)}; leaving it")
             continue
         if not send(rec):
-            break  # route is still down; do not hammer the rest
+            # This one failed. The route is intermittently up, so try the rest
+            # rather than stalling the whole queue behind one bad connection.
+            continue
         try:
             os.remove(path)
         except OSError:

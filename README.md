@@ -323,7 +323,7 @@ and re-subscribe the phone.
 
 ```bash
 python3 tests/test_notify.py     # 40 tests — the sender, end to end
-python3 tests/test_lib.py        # 46 tests — the library, reply routing, ask/events guards
+python3 tests/test_lib.py        # 48 tests — the library, reply routing, ask/events guards
 python3 tests/test_install.py    # 11 tests — install/update/uninstall
 python3 tests/argcheck.py        # 39 assertions — flag/doc/portability drift
 ```

@@ -1,10 +1,10 @@
 [Unit]
-Description=Retry undelivered ntfy notifications every 2 minutes
+Description=Retry undelivered ntfy notifications every minute
 
 [Timer]
-OnBootSec=2min
-OnUnitActiveSec=2min
-AccuracySec=20s
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=15s
 Unit=ntfy-outbox.service
 
 [Install]
